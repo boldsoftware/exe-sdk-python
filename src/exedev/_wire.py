@@ -8,21 +8,30 @@ from __future__ import annotations
 import base64
 import binascii
 import codecs
+import fnmatch
+import functools
+import gzip
+import io
 import json
 import os
+import random
 import re
 import shlex
+import signal
+import sys
+import tarfile
 from collections.abc import Awaitable, Callable, Coroutine, Generator, Iterable, Mapping, Sequence
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from datetime import datetime
-import functools
-from contextlib import AbstractAsyncContextManager
+from pathlib import Path, PurePosixPath
 from typing import Any, Generic, Literal, ParamSpec, TypeVar, cast
 
 import httpx
 
 from ._errors import (
     CommandInterruptedError,
+    ExeError,
     OutputLimitError,
     ProtocolError,
     is_error_document,
@@ -44,6 +53,8 @@ HEADERS = {
 }
 
 MAX_OUTPUT = 8 * 1024 * 1024
+UNLIMITED = sys.maxsize
+MAX_LINE = 64 * 1024
 # Output frames carry one write each, which is small; refuse an unbounded
 # frame even when not capturing.
 MAX_FRAME = 1024 * 1024
@@ -222,6 +233,7 @@ class Output:
             "stdout": codecs.getincrementaldecoder("utf-8")(errors="replace"),
             "stderr": codecs.getincrementaldecoder("utf-8")(errors="replace"),
         }
+        self._partial: dict[Stream, str] = {"stdout": "", "stderr": ""}
 
     def feed(self, data: bytes) -> list[tuple[Stream, bytes]]:
         """Read a chunk of the body; return the output it completes."""
@@ -245,9 +257,24 @@ class Output:
             raise self.interrupted()
         return [frame] if frame is not None else []
 
-    def text(self, stream: Stream, data: bytes, final: bool = False) -> str:
-        """Decode data, which continues stream's output, as text."""
-        return self._decoders[stream].decode(data, final)
+    def lines(self, stream: Stream, data: bytes, final: bool = False) -> list[str]:
+        """The lines that data, which continues stream's output, completes,
+        without their line endings. final ends the last line. A line longer
+        than MAX_LINE characters arrives in pieces of that size."""
+        text = self._partial[stream] + self._decoders[stream].decode(data, final)
+        *complete, rest = text.split("\n")
+        lines = []
+        for line in complete:
+            line = line.removesuffix("\r")
+            lines += [line[i : i + MAX_LINE] for i in range(0, len(line), MAX_LINE)] or [""]
+        while len(rest) > MAX_LINE:
+            lines.append(rest[:MAX_LINE])
+            rest = rest[MAX_LINE:]
+        if final and rest:
+            lines.append(rest)
+            rest = ""
+        self._partial[stream] = rest
+        return lines
 
     def interrupted(
         self, cls: type[CommandInterruptedError] = CommandInterruptedError, *args: str, reason: str | None = None
@@ -317,12 +344,12 @@ class VMInfo:
     """What the SDK knows about a VM."""
 
     name: str
+    status: str
+    ssh_dest: str
+    https_url: str
     tags: tuple[str, ...] = ()
-    status: str | None = None
-    ssh_dest: str | None = None
-    https_url: str | None = None
     region: str | None = None
-    comment: str | None = None
+    comment: str = ""
     created_at: datetime | None = None
     prompt_error: str | None = None
 
@@ -355,12 +382,13 @@ def vm_info(value: object, operation: Literal["new", "ls", "cp"]) -> VMInfo:
         raise ProtocolError(operation) from None
     return VMInfo(
         name=name,
+        # new does not say; a new VM is starting until it answers.
+        status=string("state" if cp else "status", operation == "ls") or "starting",
+        ssh_dest=cast(str, string("ssh" if cp else "ssh_dest", True)),
+        https_url=cast(str, string("https_url", True)),
         tags=tuple(cast(list[str], tags)),
-        status=string("state" if cp else "status"),
-        ssh_dest=string("ssh" if cp else "ssh_dest", True),
-        https_url=string("https_url", not cp),
         region=string("region"),
-        comment=string("comment"),
+        comment=string("comment") or "",
         created_at=created_at,
         prompt_error=string("error"),
     )
@@ -500,38 +528,357 @@ def ready_timeout(until: object, timeout: float | None) -> float:
 
 
 _P = ParamSpec("_P")
-_VM = TypeVar("_VM", bound=AbstractAsyncContextManager[Any])
+_CM = TypeVar("_CM", bound=AbstractAsyncContextManager[Any])
 
 
-class Creating(Awaitable[_VM], Generic[_VM]):
-    """A VM on its way: await it, or use it as an async context manager to
-    delete the VM at the end of the block::
+class Creating(Coroutine[Any, Any, _CM], Generic[_CM]):
+    """A coroutine that makes a resource, such as a VM: await it, or use it
+    as an async context manager to release the resource at the end of the
+    block::
 
         async with exe.new() as vm:
             ...
     """
 
-    def __init__(self, creation: Coroutine[Any, Any, _VM]) -> None:
+    def __init__(self, creation: Coroutine[Any, Any, _CM]) -> None:
         self._creation = creation
-        self._vm: _VM | None = None
+        self._made: _CM | None = None
 
-    def __await__(self) -> Generator[Any, None, _VM]:
+    def __await__(self) -> Generator[Any, None, _CM]:
         return self._creation.__await__()
 
-    async def __aenter__(self) -> _VM:
-        self._vm = await self._creation
-        return cast(_VM, await self._vm.__aenter__())
+    def send(self, value: Any) -> Any:
+        return self._creation.send(value)
+
+    def throw(self, *args: Any) -> Any:
+        return self._creation.throw(*args)
+
+    def close(self) -> None:
+        self._creation.close()
+
+    async def __aenter__(self) -> _CM:
+        self._made = await self._creation
+        return cast(_CM, await self._made.__aenter__())
 
     async def __aexit__(self, *exc: Any) -> None:
-        assert self._vm is not None
-        await self._vm.__aexit__(*exc)
+        assert self._made is not None
+        await self._made.__aexit__(*exc)
 
 
-def creates(method: Callable[_P, Coroutine[Any, Any, _VM]]) -> Callable[_P, Creating[_VM]]:
-    """Make an async method that creates a VM return a Creating."""
+def creates(method: Callable[_P, Coroutine[Any, Any, _CM]]) -> Callable[_P, Creating[_CM]]:
+    """Make an async method that makes a resource return a Creating."""
 
     @functools.wraps(method)
-    def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> Creating[_VM]:
+    def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> Creating[_CM]:
         return Creating(method(*args, **kwargs))
 
     return wrapper
+
+
+# Retries of requests the server refused with 429, which it does before
+# reading the command: a retry cannot run anything twice.
+
+
+def retry_delay(response: httpx.Response, attempt: int) -> float:
+    """Seconds to wait before retrying a 429: Retry-After, or exponential backoff with jitter."""
+    try:
+        after = float(response.headers.get("Retry-After", ""))
+    except ValueError:
+        after = 0.0
+    backoff: float = 0.5 * 2**attempt
+    return min(max(after, backoff) + random.uniform(0, backoff / 2), 60.0)
+
+
+# The SDK's own commands on the VM are POSIX shell scripts run with sh, so
+# they work whatever the user's login shell is.
+
+EXEC_LIMIT = 64 * 1024
+"""The largest request body /exec accepts."""
+
+
+def sh(script: str, *args: str) -> str:
+    """A command line that runs script with sh, with args as $1, $2, ..."""
+    return shlex.join(["sh", "-c", script, "sh", *args])
+
+
+def fits(vm: str, command: str) -> bool:
+    """Whether ssh of command on vm fits in one request."""
+    return len(f"ssh {shlex.quote(vm)} {shlex.quote(command)}".encode()) <= EXEC_LIMIT
+
+
+# Runs the command line $1 for run(): in a login shell, so that the profile
+# sets PATH (~/.local/bin, ...) as it does in a terminal, and in a session of
+# its own. When the SSH session ends early -- a timeout, a cancelled call, a
+# lost connection -- the VM kills only this script's shell; the watchdog then
+# kills everything the command started.
+#
+# The VM kills the process it started for the session: this script, or a
+# login shell that runs it. The watchdog notices either, as this script
+# ending or its parent changing.
+RUN_SCRIPT = """\
+s=${SHELL:-/bin/sh}
+command -v setsid >/dev/null 2>&1 || exec "$s" -lc "$1"
+setsid "$s" -lc "$1" &
+p=$!
+parent() { st=$(cat /proc/$$/stat 2>/dev/null) && st=${st##*) } && set -- $st && echo $2; }
+pp=$(parent)
+(while [ "$(parent)" = "$pp" ]; do sleep 1; done; kill -KILL -$p) >/dev/null 2>&1 &
+w=$!
+wait $p
+c=$?
+kill $w 2>/dev/null
+exit $c"""
+
+# A command line too long for one request is uploaded first, then run as
+# this: the script reads and deletes the file, then runs what it read.
+UPLOADED_COMMAND = 'c=$(cat {path}) && rm -f {path} && eval "$c"'
+
+
+# Files. Paths on the VM are relative to the home directory. Data travels
+# as base64 command-line arguments, in parts when it is large.
+
+PART_SIZE = 63 * 1024
+"""Base64 characters per part of a large file: a part's request must fit in EXEC_LIMIT."""
+PARALLEL = 8
+"""Requests in flight at once for one file."""
+
+
+def remote_path(path: object) -> str:
+    """A path on the VM, as a shell argument that cannot be read as an option."""
+    p = os.fspath(cast(Any, path)) if isinstance(path, (str, os.PathLike)) else None
+    if not isinstance(p, str) or not p or "\x00" in p:
+        raise TypeError("a path on the VM must be a nonempty str or PurePosixPath")
+    if p == "~" or p.startswith("~/"):
+        # Not expanded by a shell: the home directory is where relative paths start.
+        p = "." + p[1:]
+    return "./" + p if p.startswith("-") else p
+
+
+def pack(data: object) -> tuple[bytes, bool]:
+    """File contents to send, and whether they are gzipped: a large file, if that makes it smaller."""
+    if isinstance(data, str):
+        raw = data.encode()
+    elif isinstance(data, (bytes, bytearray, memoryview)):
+        raw = bytes(data)
+    else:
+        raise TypeError("data must be str or bytes")
+    if len(raw) > PART_SIZE:
+        packed = gzip.compress(raw, compresslevel=6, mtime=0)
+        if len(packed) < len(raw) * 0.9:
+            return packed, True
+    return raw, False
+
+
+def file_mode(mode: object) -> str:
+    if mode is None:
+        return ""
+    if not isinstance(mode, int) or isinstance(mode, bool) or not 0 <= mode <= 0o7777:
+        raise ValueError("mode must be an int such as 0o644")
+    return format(mode, "o")
+
+
+# $1 path, $2 base64 data, or "" to read the parts in directory $5;
+# $3 mode or ""; $4 "gz" if the data is gzipped.
+WRITE_SCRIPT = """\
+f=$1 data=$2 mode=$3 gz=$4 parts=$5
+data() { if [ -n "$parts" ]; then cat "$parts"/*; else printf %s "$data"; fi; }
+case $f in */*) mkdir -p "${f%/*}" || exit;; esac
+if [ -n "$gz" ]; then data | base64 -d | gzip -dc > "$f"; else data | base64 -d > "$f"; fi
+c=$?
+if [ -n "$parts" ]; then rm -rf "$parts"; fi
+if [ $c = 0 ] && [ -n "$mode" ]; then chmod "$mode" "$f" || c=$?; fi
+exit $c"""
+
+# $1 directory, $2 part number, $3 base64 data.
+PART_SCRIPT = 'mkdir -p "$1" && printf %s "$3" > "$1/$2"'
+
+MISSING = 2
+"""The exit status of the SDK's scripts for a file or process that does not exist."""
+IS_DIRECTORY = 3
+RUNNING = 3
+"""The exit status of SPAWN_SCRIPT when the name is taken by a running process."""
+
+READ_SCRIPT = """\
+if [ -d "$1" ]; then exit 3; fi
+if [ ! -e "$1" ]; then exit 2; fi
+exec cat "$1\""""
+
+# Prints D and a gzipped tar of a directory's contents, or F and a file.
+DOWNLOAD_SCRIPT = """\
+if [ -d "$1" ]; then printf D && exec tar -czf - -C "$1" .; fi
+if [ ! -e "$1" ]; then exit 2; fi
+printf F && exec cat "$1\""""
+
+# $1 archive, $2 directory to extract it into.
+UNTAR_SCRIPT = 'mkdir -p "$2" && tar -xzf "$1" -C "$2"; c=$?; rm -f "$1"; exit $c'
+
+
+def tar_directory(root: Path, exclude: Sequence[str]) -> bytes:
+    """A gzipped tar of root's contents, leaving out names matching exclude."""
+    if isinstance(exclude, str):
+        raise TypeError("exclude must be a sequence of patterns, not a str")
+
+    def keep(info: tarfile.TarInfo) -> tarfile.TarInfo | None:
+        name = PurePosixPath(info.name).name
+        if any(fnmatch.fnmatchcase(name, pattern) for pattern in exclude):
+            return None
+        info.uid = info.gid = 0
+        info.uname = info.gname = ""
+        return info
+
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz", compresslevel=6) as archive:
+        for child in sorted(root.iterdir()):
+            archive.add(child, arcname=child.name, filter=keep)
+    return buffer.getvalue()
+
+
+def untar(data: bytes, root: Path) -> None:
+    """Extract a gzipped tar from the VM into root. Members that would land
+    outside root, or are not regular files, directories, or links within it,
+    are refused."""
+    if not hasattr(tarfile, "data_filter"):
+        raise ExeError("downloading a directory needs Python 3.11.4 or later")
+    root.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
+        archive.extractall(root, filter="data")
+
+
+# Processes started by spawn(). Each has a directory on the VM, named for
+# it, holding its pid (which is its process group), the boot it started
+# in, its output, and once it ends, its exit status. A monitor process
+# waits for it and writes the exit status.
+
+_PROCESS_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
+
+
+def process_name(name: object) -> str:
+    if not isinstance(name, str):
+        raise TypeError("a process name must be a str")
+    if not _PROCESS_NAME.match(name):
+        raise ValueError(f"{name!r} is not a process name: use letters, digits, '.', '_', and '-'")
+    return name
+
+
+_PROCESSES = """\
+base=${XDG_STATE_HOME:-$HOME/.local/state}/exedev/processes
+# Prints the process in directory $1 as "PID running", "PID exited STATUS",
+# or "PID lost"; fails if there is none.
+state() {
+  p=$(cat "$1/pid" 2>/dev/null) || return
+  if [ -f "$1/exit" ]; then echo "$p exited $(cat "$1/exit")"; return; fi
+  if [ "$(cat "$1/boot" 2>/dev/null)" = "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)" ] &&
+    kill -0 "$(cat "$1/monitor" 2>/dev/null)" 2>/dev/null; then echo "$p running"; return; fi
+  if [ -f "$1/exit" ]; then echo "$p exited $(cat "$1/exit")"; return; fi
+  echo "$p lost"
+}
+"""
+
+# $1 name, $2 command line. Prints the pid; exits 3 if the name is taken
+# by a running process.
+SPAWN_SCRIPT = (
+    _PROCESSES
+    + """\
+d=$base/$1
+case $(state "$d") in *" running") exit 3;; esac
+rm -rf "$d" && mkdir -p "$d" || exit
+cat /proc/sys/kernel/random/boot_id > "$d/boot" 2>/dev/null
+printf '%s\\n' "$2" > "$d/command"
+setsid sh -c 'echo $$ > "$1/monitor"
+setsid "${SHELL:-/bin/sh}" -lc "$2" < /dev/null > "$1/stdout" 2> "$1/stderr" &
+echo $! > "$1/pid.new" && mv "$1/pid.new" "$1/pid"
+wait $!
+echo $? > "$1/exit.new" && mv "$1/exit.new" "$1/exit"' sh "$d" "$2" < /dev/null > /dev/null 2>&1 &
+i=0
+while [ ! -f "$d/pid" ] && [ $i -lt 100 ]; do sleep 0.05; i=$((i+1)); done
+cat "$d/pid\""""
+)
+
+# $1 name. Prints the state; exits 2 if there is no such process.
+STATE_SCRIPT = _PROCESSES + 'state "$base/$1" || exit 2'
+
+# Prints each process as "NAME PID STATE...".
+LIST_SCRIPT = (
+    _PROCESSES
+    + """\
+for d in "$base"/*; do
+  if s=$(state "$d"); then echo "${d##*/} $s"; fi
+done"""
+)
+
+# $1 name, $2 nonce, $3 "1" to print the output. Waits for the process to
+# end, then writes its output and exits with its status. Prints "NONCE
+# missing" or "NONCE lost" instead when there is no process, or it ended
+# without a status.
+WAIT_SCRIPT = (
+    _PROCESSES
+    + """\
+d=$base/$1
+while s=$(state "$d") && [ "${s#* }" = running ]; do sleep 0.5; done
+case $s in
+"") printf '%s missing' "$2"; exit 0;;
+*" lost") printf '%s lost' "$2"; exit 0;;
+esac
+if [ -n "$3" ]; then cat "$d/stdout"; cat "$d/stderr" >&2; fi
+exit "${s##* }\""""
+)
+
+# $1 name, $2 lines from the end, or "" for all.
+LOGS_SCRIPT = (
+    _PROCESSES
+    + """\
+d=$base/$1
+[ -f "$d/pid" ] || exit 2
+if [ -n "$2" ]; then
+  tail -n "$2" "$d/stdout" && tail -n "$2" "$d/stderr" >&2
+else
+  cat "$d/stdout" && cat "$d/stderr" >&2
+fi"""
+)
+
+# $1 name, $2 signal name. Signals the process group, if it is running.
+KILL_SCRIPT = (
+    _PROCESSES
+    + """\
+s=$(state "$base/$1") || exit 2
+case $s in *" running") kill -"$2" -"${s%% *}" 2>/dev/null || kill -"$2" "${s%% *}";; esac"""
+)
+
+
+def signal_name(sig: object) -> str:
+    """A signal as the VM's kill command takes it: "TERM", or a number."""
+    if isinstance(sig, signal.Signals):
+        return sig.name.removeprefix("SIG")
+    if isinstance(sig, int) and not isinstance(sig, bool) and 0 < sig < 128:
+        return str(sig)
+    if isinstance(sig, str) and re.fullmatch(r"(SIG)?[A-Z][A-Z0-9+-]*", sig):
+        return sig.removeprefix("SIG")
+    raise ValueError(f"{sig!r} is not a signal")
+
+
+@dataclass(frozen=True)
+class Logs:
+    """A spawned process's output so far."""
+
+    stdout: str
+    stderr: str
+
+
+@dataclass
+class ProcessState:
+    pid: int
+    exit_code: int | None = None
+    lost: bool = False
+
+
+def process_state(line: str) -> ProcessState:
+    """Parse "PID running", "PID exited STATUS", or "PID lost"."""
+    words = line.split()
+    try:
+        if len(words) == 2 and words[1] in ("running", "lost"):
+            return ProcessState(int(words[0]), lost=words[1] == "lost")
+        if len(words) == 3 and words[1] == "exited":
+            return ProcessState(int(words[0]), int(words[2]))
+    except ValueError:
+        pass
+    raise ProtocolError("process state")

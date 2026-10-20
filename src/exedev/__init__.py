@@ -11,7 +11,7 @@
 AsyncClient is the same API for asyncio.
 """
 
-from ._async import AsyncClient, AsyncVM
+from ._async import AsyncClient, AsyncProcess, AsyncVM
 from ._errors import (
     APIError,
     AuthenticationError,
@@ -23,17 +23,20 @@ from ._errors import (
     NotFoundError,
     OutputLimitError,
     PermissionDeniedError,
+    ProcessLostError,
     ProtocolError,
     RateLimitError,
+    VMNotRunningError,
     VMReadyError,
     VMSetupError,
 )
-from ._sync import Client, VM
-from ._wire import CommandResult
+from ._sync import VM, Client, Process
+from ._wire import CommandResult, Logs
 
 __all__ = [
     "APIError",
     "AsyncClient",
+    "AsyncProcess",
     "AsyncVM",
     "AuthenticationError",
     "Client",
@@ -42,18 +45,22 @@ __all__ = [
     "CommandResult",
     "CommandTimeoutError",
     "ExeError",
+    "Logs",
     "NetworkError",
     "NotFoundError",
     "OutputLimitError",
     "PermissionDeniedError",
+    "Process",
+    "ProcessLostError",
     "ProtocolError",
     "RateLimitError",
     "VM",
+    "VMNotRunningError",
     "VMReadyError",
     "VMSetupError",
 ]
 
 # Document the public classes where they are used from.
-for _cls in (AsyncClient, AsyncVM, Client, VM, CommandResult):
+for _cls in (AsyncClient, AsyncVM, AsyncProcess, Client, VM, Process, CommandResult, Logs):
     _cls.__module__ = __name__
 del _cls

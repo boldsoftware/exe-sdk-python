@@ -1,6 +1,6 @@
 [project]
 name = "exedev"
-version = "0.1.0"
+version = "0.2.0"
 description = "Official Python SDK for the exe.dev HTTPS API"
 readme = "README.md"
 license = "MIT"
@@ -38,4 +38,4 @@ include = ["src"]
 
 [tool.ruff]
 line-length = 120
-extend-exclude = ["src/exedev"]  # generated
+extend-exclude = ["src/exedev", "README.md"]  # generated; aligned comments

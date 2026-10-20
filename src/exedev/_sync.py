@@ -4,16 +4,25 @@
 
 from __future__ import annotations
 
+import base64
 import contextlib
+import errno
+import functools
 import inspect
 import os
+import secrets
 import shlex
+import signal
+import stat
 import time
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from pathlib import Path, PurePosixPath
 from time import monotonic
 from types import TracebackType
 from typing import Any, Literal
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
@@ -28,46 +37,81 @@ from ._errors import (
     NotFoundError,
     OutputLimitError,
     PermissionDeniedError,
+    ProcessLostError,
     ProtocolError,
     VMReadyError,
     VMSetupError,
     api_error,
     is_error_document,
     parse_documents,
+    ssh_error,
 )
 from ._wire import (
     DEFAULT_BASE_URL,
+    DOWNLOAD_SCRIPT,
     HEADERS,
+    IS_DIRECTORY,
+    KILL_SCRIPT,
+    LIST_SCRIPT,
+    LOGS_SCRIPT,
     MAX_OUTPUT,
+    MISSING,
+    PARALLEL,
+    PART_SCRIPT,
+    PART_SIZE,
+    READ_SCRIPT,
     RETRYABLE,
+    RUN_SCRIPT,
+    RUNNING,
     SETUP_PROBE,
+    SPAWN_SCRIPT,
+    STATE_SCRIPT,
     TIMEOUT,
+    UNLIMITED,
+    UNTAR_SCRIPT,
+    UPLOADED_COMMAND,
+    WAIT_SCRIPT,
+    WRITE_SCRIPT,
     Arg,
     CommandResult,
     Flag,
+    Logs,
     Output,
+    ProcessState,
     SetupFailure,
+    Stream,
     VMInfo,
     check_ready,
     command_line,
     env_flags,
+    file_mode,
+    fits,
     is_ndjson,
     on_off,
+    pack,
+    process_name,
+    process_state,
     ready_timeout,
+    remote_path,
     required,
+    retry_delay,
     rm_result,
     setup_state,
+    sh,
+    signal_name,
     ssh_command,
     stream_timeout,
+    tar_directory,
+    untar,
     vm_info,
     vm_list,
     vm_name,
 )
 
-__all__ = ["Client", "VM"]
+__all__ = ["Client", "Process", "VM"]
 
 OutputCallback = Callable[[str], object]
-"""Called with output as it arrives, decoded as UTF-8."""
+"""Called with each line of output as it arrives, decoded as UTF-8, without its line ending."""
 
 WaitUntil = Literal["ssh", "setup", "created"]
 
@@ -75,28 +119,39 @@ WaitUntil = Literal["ssh", "setup", "created"]
 class _Transport:
     """Runs exe.dev commands over HTTPS: POST /exec with the command line as the body."""
 
-    def __init__(self, token: str, base_url: str, http_client: httpx.Client | None) -> None:
+    def __init__(self, token: str, base_url: str, http_client: httpx.Client | None, max_retries: int) -> None:
+        if not isinstance(max_retries, int) or isinstance(max_retries, bool) or max_retries < 0:
+            raise TypeError("max_retries must be a nonnegative int")
         self._url = base_url.rstrip("/") + "/exec"
         self._headers = {**HEADERS, "Authorization": f"Bearer {token}"}
         self._owned = http_client is None
         self._http = http_client if http_client is not None else httpx.Client(timeout=TIMEOUT)
+        self._retries = max_retries
 
     def close(self) -> None:
         if self._owned:
             self._http.close()
 
-    def _request(self, command: str, timeout: httpx.Timeout = TIMEOUT) -> httpx.Request:
-        return self._http.build_request(
-            "POST", self._url, content=command.encode(), headers=self._headers, timeout=timeout
-        )
+    def _send(self, command: str, timeout: httpx.Timeout = TIMEOUT, stream: bool = False) -> httpx.Response:
+        """POST command, retrying while the server says 429 (before running anything)."""
+        attempt = 0
+        while True:
+            request = self._http.build_request(
+                "POST", self._url, content=command.encode(), headers=self._headers, timeout=timeout
+            )
+            response = self._http.send(request, stream=stream)
+            if response.status_code != 429 or attempt >= self._retries:
+                return response
+            response.close()
+            time.sleep(retry_delay(response, attempt))
+            attempt += 1
 
     def documents(
         self, path: str, args: Sequence[Arg] = (), flags: Sequence[Flag] = ()
     ) -> tuple[int, str, list[Any] | None]:
         """A successful response's status, body, and JSON documents, including in-band error documents."""
-        request = self._request(command_line(path, args, flags))
         try:
-            response = self._http.send(request)
+            response = self._send(command_line(path, args, flags))
         except httpx.RequestError as err:
             raise NetworkError(path, err) from err
         body = response.text
@@ -138,9 +193,10 @@ class _Transport:
         def timed_out() -> CommandInterruptedError:
             return output.interrupted(CommandTimeoutError, "the command did not finish within its timeout")
 
-        request = self._request(f"ssh {shlex.quote(vm)} {shlex.quote(command)}", stream_timeout(timeout))
         try:
-            response = self._http.send(request, stream=True)
+            response = self._send(
+                f"ssh {shlex.quote(vm)} {shlex.quote(command)}", stream_timeout(timeout), stream=True
+            )
         except httpx.RequestError as err:
             # The request may have reached the VM: whether the command ran is unknown.
             raise (timed_out() if expired() else output.interrupted()) from err
@@ -150,7 +206,7 @@ class _Transport:
                     response.read()
                 except httpx.RequestError as err:
                     raise NetworkError("ssh", err) from err
-                raise api_error("ssh", response.status_code, response.text)
+                raise ssh_error(vm, response.status_code, response.text)
             if not is_ndjson(response):
                 # An older server may be streaming the command's raw output, which
                 # can be endless: do not read it as an error, or claim the command
@@ -165,25 +221,29 @@ class _Transport:
                 except httpx.RequestError as err:
                     raise (timed_out() if expired() else output.interrupted()) from err
                 for stream, data in output.feed(chunk):
-                    _deliver(callbacks[stream], output.text(stream, data))
+                    _deliver(callbacks[stream], output, stream, data)
                 if expired():
                     raise timed_out()
             for stream, data in output.finish():
-                _deliver(callbacks[stream], output.text(stream, data))
+                _deliver(callbacks[stream], output, stream, data)
             for stream in ("stdout", "stderr"):
-                _deliver(callbacks[stream], output.text(stream, b"", final=True))
+                _deliver(callbacks[stream], output, stream, b"", final=True)
             return output.result()
         finally:
             # Before the end of the body, this ends the command.
             response.close()
 
 
-def _deliver(callback: OutputCallback | None, text: str) -> None:
-    if callback is None or not text:
+def _deliver(
+    callback: OutputCallback | None, output: Output, stream: Stream, data: bytes, final: bool = False
+) -> None:
+    """Call callback with each line that data completes."""
+    if callback is None:
         return
-    result = callback(text)
-    if inspect.isawaitable(result):
-        raise TypeError("output callbacks must not be coroutine functions; use Client for those")
+    for line in output.lines(stream, data, final):
+        result = callback(line)
+        if inspect.isawaitable(result):
+            raise TypeError("output callbacks must not be coroutine functions; use Client for those")
 
 
 class VM:
@@ -213,18 +273,18 @@ class VM:
         return self._info.name
 
     @property
-    def status(self) -> str | None:
-        """Such as "running" or "paused"; None until known."""
+    def status(self) -> str:
+        """Such as "starting", "running", or "paused", when last seen."""
         return self._info.status
 
     @property
-    def ssh_dest(self) -> str | None:
-        """The SSH destination, such as "myvm.exe.xyz"; None until known."""
+    def ssh_dest(self) -> str:
+        """The SSH destination, such as "myvm.exe.xyz"."""
         return self._info.ssh_dest
 
     @property
-    def https_url(self) -> str | None:
-        """The VM's web URL; None until known."""
+    def https_url(self) -> str:
+        """The VM's web URL, such as "https://myvm.exe.xyz/". url() makes others."""
         return self._info.https_url
 
     @property
@@ -232,15 +292,18 @@ class VM:
         return self._info.tags
 
     @property
-    def comment(self) -> str | None:
+    def comment(self) -> str:
+        """The VM's comment; "" when it has none."""
         return self._info.comment
 
     @property
     def region(self) -> str | None:
+        """The VM's region; None until listed (see refresh())."""
         return self._info.region
 
     @property
     def created_at(self) -> datetime | None:
+        """When the VM was created; None until listed (see refresh())."""
         return self._info.created_at
 
     @property
@@ -248,9 +311,23 @@ class VM:
         """Why new(prompt=...) did not reach Shelley, when it did not."""
         return self._info.prompt_error
 
+    def url(self, port: int | None = None, path: str = "/") -> str:
+        """A URL that reaches the VM through exe.dev's HTTPS proxy.
+
+        Without a port, it is https_url, which reaches the VM's default port
+        (see share.port()). With one, it reaches that port; the proxy serves
+        ports 3000 to 9999. Who may visit depends on how the VM is shared.
+        """
+        if port is not None and (not isinstance(port, int) or isinstance(port, bool) or not 0 < port < 65536):
+            raise ValueError("port must be an int from 1 to 65535")
+        if not isinstance(path, str) or not path.startswith("/"):
+            raise ValueError("path must be a str starting with /")
+        url = urlsplit(self.https_url)
+        netloc = url.netloc if port is None else f"{url.hostname}:{port}"
+        return urlunsplit((url.scheme, netloc, path, "", ""))
+
     def __repr__(self) -> str:
-        status = f" status={self.status!r}" if self.status else ""
-        return f"<{type(self).__name__} {self.name!r}{status}>"
+        return f"<{type(self).__name__} {self.name!r} status={self.status!r}>"
 
     def __enter__(self) -> VM:
         if not self._owned:
@@ -277,12 +354,12 @@ class VM:
 
     def _renamed(self, result: Mapping[str, object]) -> None:
         """Take a new name, and the destinations that change with it."""
-        # Take the server's destinations; never invent them. An older server
-        # does not report them, and then they are unknown.
-        dests = {k: v if isinstance(v := result.get(k), str) and v else None for k in ("ssh_dest", "https_url")}
+        ssh_dest, https_url = result.get("ssh_dest"), result.get("https_url")
+        if not isinstance(ssh_dest, str) or not ssh_dest or not isinstance(https_url, str) or not https_url:
+            raise ProtocolError("rename")
         self._info.name = vm_name(result["new_name"])
-        self._info.ssh_dest = dests["ssh_dest"]
-        self._info.https_url = dests["https_url"]
+        self._info.ssh_dest = ssh_dest
+        self._info.https_url = https_url
 
     def run(
         self,
@@ -299,31 +376,40 @@ class VM:
     ) -> CommandResult:
         """Run a command on the VM, once, and return how it ended.
 
-        A string is a shell command line; a sequence of strings is an argument
-        list, which is quoted for you: ``vm.run(["cat", path])``.
+        A string is a shell command line, which the VM user's login shell
+        runs as a login shell, so PATH is as in a terminal. A sequence of
+        strings is an argument list, which is quoted for you:
+        ``vm.run(["cat", path])``.
 
         Like subprocess.run, a nonzero exit status is a result, not an
         exception, unless check is true; then it raises CommandError.
 
         cwd is the directory to run it in, and env variables to set for it.
-        The command runs in the VM user's login shell.
 
-        on_stdout and on_stderr are called, one at a time, as output
-        arrives. An exception from one stops the command and propagates.
+        on_stdout and on_stderr are called with each line of output, without
+        its line ending, as it arrives; ``on_stdout=print`` works. They are
+        called one at a time. An exception from one stops the command
+        and propagates.
         Output is also captured, up to max_output bytes in all (8 MiB by
         default; more raises OutputLimitError). For long or large output,
         pass capture=False and stream it.
 
-        timeout is in seconds; a command still running then is stopped, and
-        CommandTimeoutError raised. Without a timeout, a command may run for
-        as long as it likes.
+        timeout is in seconds; a command still running then is stopped,
+        with every process it started, and CommandTimeoutError raised.
+        Without a timeout, a command may run for as long as it likes.
+
+        run() returns once the command has exited and its output has
+        closed, so a process left running in the background with stdout or
+        stderr open keeps it waiting. Start those with spawn().
 
         If the connection breaks first, CommandInterruptedError: whether the
-        command finished is unknown. Requires ssh permission.
+        command finished is unknown. A command line too long for one request
+        is uploaded as a file first. Requires ssh permission.
         """
+        script = self._fit(ssh_command(command, cwd, env), lambda line: sh(RUN_SCRIPT, line))
         result = self._t.ssh(
             self.name,
-            ssh_command(command, cwd, env),
+            script,
             capture=capture,
             max_output=max_output,
             on_stdout=on_stdout,
@@ -334,14 +420,177 @@ class VM:
             raise CommandError(result)
         return result
 
+    def _fit(self, line: str, make: Callable[[str], str]) -> str:
+        """make(line), or if that does not fit in a request, make() of a
+        command line that runs line from a file uploaded first."""
+        command = make(line)
+        if fits(self.name, command):
+            return command
+        path = f"/tmp/.exedev-command-{secrets.token_hex(8)}"
+        self.write_file(path, line)
+        return make(UPLOADED_COMMAND.format(path=path))
+
+    def _script(self, command: str, max_output: int = MAX_OUTPUT, ok: Sequence[int] = ()) -> CommandResult:
+        """Run one of the SDK's scripts. An exit status other than 0 or those in ok raises CommandError."""
+        result = self._t.ssh(self.name, command, max_output=max_output)
+        if result.exit_code != 0 and result.exit_code not in ok:
+            raise CommandError(result)
+        return result
+
+    def _parallel(self, jobs: Sequence[Callable[[], object]]) -> None:
+        """Run jobs, PARALLEL at a time. The first to fail stops the rest."""
+
+
+        with ThreadPoolExecutor(PARALLEL) as pool:
+            futures = [pool.submit(job) for job in jobs]
+            try:
+                for future in futures:
+                    future.result()
+            finally:
+                for future in futures:
+                    future.cancel()
+
+    def _file_error(self, exit_code: int, path: object) -> None:
+        if exit_code == MISSING:
+            raise FileNotFoundError(errno.ENOENT, f"No such file or directory on VM {self.name}", str(path))
+        if exit_code == IS_DIRECTORY:
+            raise IsADirectoryError(errno.EISDIR, f"Is a directory on VM {self.name}", str(path))
+
+    def write_file(self, path: str | PurePosixPath, data: str | bytes, *, mode: int | None = None) -> None:
+        """Write a file on the VM, replacing it, and making its directory if need be.
+
+        path is relative to the home directory unless it is absolute. A str
+        is written as UTF-8. mode, such as 0o755, sets the file's permissions.
+
+        A request carries at most 64 KB, so a large file goes in parts,
+        several at a time. The VM needs base64, and gzip for a large file.
+        Requires ssh permission.
+        """
+        remote = remote_path(path)
+        packed, gz = pack(data)
+        encoded = base64.b64encode(packed).decode()
+        options = (file_mode(mode), "gz" if gz else "")
+        command = sh(WRITE_SCRIPT, remote, encoded, *options, "")
+        if fits(self.name, command):
+            self._script(command)
+            return
+        parts = f"/tmp/.exedev-upload-{secrets.token_hex(8)}"
+        try:
+            self._parallel(
+                [
+                    functools.partial(self._script, sh(PART_SCRIPT, parts, f"{i:06d}", encoded[start : start + PART_SIZE]))
+                    for i, start in enumerate(range(0, len(encoded), PART_SIZE))
+                ]
+            )
+        except Exception:
+            with contextlib.suppress(ExeError):
+                self._t.ssh(self.name, f"rm -rf {parts}", capture=False, timeout=30)
+            raise
+        self._script(sh(WRITE_SCRIPT, remote, "", *options, parts))
+
+    def read_file(self, path: str | PurePosixPath) -> bytes:
+        """The contents of a file on the VM, which raises FileNotFoundError if
+        there is none. path is relative to the home directory unless it is
+        absolute. Requires ssh permission."""
+        result = self._script(sh(READ_SCRIPT, remote_path(path)), UNLIMITED, ok=(MISSING, IS_DIRECTORY))
+        self._file_error(result.exit_code, path)
+        return result.stdout_bytes
+
+    def upload(
+        self, local: str | os.PathLike[str], remote: str | PurePosixPath, *, exclude: Sequence[str] = ()
+    ) -> None:
+        """Copy a local file or directory to the VM.
+
+        A file is written to remote, with its permissions. A directory's
+        contents are copied into remote, which is made if need be; exclude
+        leaves out files and directories whose names match any of its
+        patterns, such as ``[".git", "node_modules", "*.pyc"]``. The VM needs
+        tar for a directory. Requires ssh permission.
+        """
+        source = Path(local)
+        destination = remote_path(remote)
+        if source.is_dir():
+            archive = tar_directory(source, exclude)
+            temporary = f"/tmp/.exedev-upload-{secrets.token_hex(8)}.tgz"
+            self.write_file(temporary, archive)
+            self._script(sh(UNTAR_SCRIPT, temporary, destination))
+        else:
+            self.write_file(destination, source.read_bytes(), mode=stat.S_IMODE(source.stat().st_mode))
+
+    def download(self, remote: str | PurePosixPath, local: str | os.PathLike[str]) -> None:
+        """Copy a file or directory from the VM.
+
+        A file is written to local. A directory's contents are copied into
+        local, which is made if need be. A path on the VM that does not
+        exist raises FileNotFoundError. The VM needs tar for a directory.
+        Requires ssh permission.
+        """
+        result = self._script(sh(DOWNLOAD_SCRIPT, remote_path(remote)), UNLIMITED, ok=(MISSING,))
+        self._file_error(result.exit_code, remote)
+        kind, data = result.stdout_bytes[:1], result.stdout_bytes[1:]
+        destination = Path(local)
+        if kind == b"D":
+            untar(data, destination)
+        elif kind == b"F":
+            destination.write_bytes(data)
+        else:
+            raise ProtocolError("download")
+
+    def spawn(
+        self,
+        command: str | Sequence[str],
+        *,
+        name: str | None = None,
+        cwd: str | os.PathLike[str] | None = None,
+        env: Mapping[str, str] | None = None,
+    ) -> Process:
+        """Start a command in the background, and return at once.
+
+        The command runs as run() runs it, but on its own: until it exits,
+        or is killed, whatever becomes of this program or its connection.
+        Its output goes to files on the VM; see Process.logs().
+
+        name identifies the process, so that process() finds it again
+        later, from anywhere; by default, it is random. It must not be the
+        name of a process still running. A process is a context manager that
+        kills it on exit::
+
+                with vm.spawn("python3 -m http.server 8000") as server:
+                ...
+
+        Requires ssh permission, and setsid on the VM.
+        """
+        name = process_name(name if name is not None else secrets.token_hex(4))
+        script = self._fit(ssh_command(command, cwd, env), lambda line: sh(SPAWN_SCRIPT, name, line))
+        result = self._script(script, ok=(RUNNING,))
+        if result.exit_code == RUNNING:
+            raise ExeError(f"a process named {name} is already running on VM {self.name}")
+        try:
+            pid = int(result.stdout)
+        except ValueError:
+            raise ProtocolError("spawn") from None
+        return Process(self, name, ProcessState(pid))
+
+    def process(self, name: str) -> Process:
+        """The process that spawn() started with this name, running or not.
+        ProcessLookupError if there is none. Requires ssh permission."""
+        result = self._script(sh(STATE_SCRIPT, process_name(name)), ok=(MISSING,))
+        if result.exit_code == MISSING:
+            raise ProcessLookupError(f"no process {name} on VM {self.name}")
+        return Process(self, name, process_state(result.stdout))
+
+    def processes(self) -> list[Process]:
+        """The processes spawn() has started, running or not. Requires ssh permission."""
+        result = self._script(sh(LIST_SCRIPT))
+        processes = []
+        for line in result.stdout.splitlines():
+            name, _, state = line.partition(" ")
+            processes.append(Process(self, process_name(name), process_state(state)))
+        return processes
+
     def refresh(self) -> None:
         """Fetch the VM's attributes. Requires ls permission."""
-        result = self._t.call("ls", [self.name], json=True)
-        for info in vm_list(result):
-            if info.name == self.name:
-                self._info = info
-                return
-        raise NotFoundError("ls", 404, '{"error": "VM not found"}')
+        self._info = _find(self._t, self.name)
 
     def wait_until_ready(self, until: Literal["ssh", "setup"] = "ssh", *, timeout: float | None = None) -> None:
         """Wait until the VM runs commands.
@@ -354,7 +603,7 @@ class VM:
         servers the VM starts.
 
         timeout is in seconds, by default 60, or 600 for setup. Raises
-        VMReadyError (the VM is not deleted). Requires ssh permission.
+        VMReadyError. Requires ssh permission.
         """
         seconds = ready_timeout(until, timeout)
         self._wait(until, seconds)
@@ -409,6 +658,23 @@ class VM:
     def _ready(self, wait_until: WaitUntil, timeout: float | None) -> None:
         if wait_until != "created":
             self._wait(wait_until, ready_timeout(wait_until, timeout))
+
+    def _created(self, wait_until: WaitUntil, timeout: float | None, keep_on_failure: bool) -> VM:
+        """Wait until a VM that new() or copy() made is ready. If that fails,
+        or is interrupted, delete it: the caller never received it."""
+        try:
+            self._ready(wait_until, timeout)
+        except BaseException as err:
+            if not (keep_on_failure and isinstance(err, VMReadyError)):
+                with contextlib.suppress(Exception):
+                    self.delete()
+            raise
+        return self
+
+    def _flush(self) -> None:
+        """Flush the VM's recent writes to its disk, if it is running. Best effort."""
+        with contextlib.suppress(ExeError):
+            self._t.ssh(self.name, "sync", capture=False, timeout=60)
 
     def delete(self) -> None:
         """Delete the VM. A VM that does not exist raises NotFoundError.
@@ -522,8 +788,10 @@ class VM:
         memory: int | str | None = None,
         pool: str | None = None,
         standalone: bool = False,
+        flush: bool = True,
         wait_until: WaitUntil = "ssh",
         timeout: float | None = None,
+        keep_on_failure: bool = False,
     ) -> VM:
         """Copy the VM: a new VM with a copy of its disk, and by default its tags.
 
@@ -532,20 +800,27 @@ class VM:
         Tag-scoped API keys may run this command.
 
         Args:
-            copy_tags: copy tags from source VM (use --copy-tags=false to disable)
+            copy_tags: copy tags from source VM (use ``copy_tags=False`` to disable)
             cpu: number of CPUs
             disk: disk size (e.g., 20, 20GB, 50G)
             memory: memory allocation (e.g., 4, 4GB, 8G)
-            pool: create the copy in one of your team's pools (see 'pool list')
+            pool: create the copy in one of your team's pools (see ``exe.pool.list()``)
             standalone: create the copy as a standalone VM with its own reserved
                 capacity (requires a plan with standalone VMs and team approval)
+            flush: first flush the VM's recent writes to its disk, so that the copy has
+                them. Best effort: it needs ssh permission, and a running VM.
             wait_until: "ssh" (the default) returns once the VM runs commands; "setup"
                 also waits for its setup script to finish, and succeed; "created"
                 returns at once. Waiting needs ssh permission, and raises VMReadyError
                 if the VM does not become ready.
             timeout: seconds to wait for readiness; by default 60, or 600 for "setup".
+            keep_on_failure: keep a VM that does not become ready, for debugging:
+                VMReadyError.vm is it. By default, it is deleted, as it is when the wait
+                is interrupted.
         """
         check_ready(wait_until, timeout)
+        if flush:
+            self._flush()
         result = self._t.call(
             "cp",
             [self.name, name],
@@ -560,8 +835,7 @@ class VM:
             json=True,
         )
         vm = VM(self._t, vm_info(result, "cp"), owned=True)
-        vm._ready(wait_until, timeout)
-        return vm
+        return vm._created(wait_until, timeout, keep_on_failure)
 
     def resize(
         self,
@@ -569,8 +843,9 @@ class VM:
         cpu: int | None = None,
         disk: int | str | None = None,
         memory: int | str | None = None,
+        restart: bool = False,
     ) -> t.ResizeResponse:
-        """Resize a VM's resources (memory, CPU, disk).
+        """Resize the VM's memory, CPUs, or disk. Memory and CPU changes take effect when it restarts.
 
         CLI: ``resize <vmname> [--memory=<size>] [--cpu=<count>] [--disk=<size>]``
 
@@ -581,6 +856,8 @@ class VM:
             disk: new total disk size (e.g., 25, 25GB) - disk size can only increase;
                 billed by usage above your plan's included disk, not by size
             memory: memory allocation (e.g., 4, 4GB, 8G)
+            restart: restart the VM afterwards, so that memory and cpu changes take
+                effect, and wait until it runs commands.
         """
         result: t.ResizeResponse = self._t.call(
             "resize",
@@ -592,6 +869,8 @@ class VM:
             ],
             json=True,
         )
+        if restart:
+            self.restart()
         return result
 
     def set_comment(self, text: str) -> t.CommentResponse:
@@ -628,6 +907,136 @@ class VM:
         return result
 
 
+def _find(transport: _Transport, name: str) -> VMInfo:
+    result = transport.call("ls", [name], json=True)
+    for info in vm_list(result):
+        if info.name == name:
+            return info
+    raise NotFoundError("ls", 404, f'{{"error": "VM {name} not found"}}')
+
+
+class Process:
+    """A process that VM.spawn() started on a VM.
+
+    Like subprocess.Popen, but the process does not depend on this program:
+    it runs until it exits or is killed. Find it again later with
+    VM.process(name). Its attributes are a snapshot; poll() and wait()
+    update them.
+
+    As a context manager, it kills the process at the end of the block.
+    """
+
+    def __init__(self, vm: VM, name: str, state: ProcessState) -> None:
+        self.vm = vm
+        """The VM it runs on."""
+        self.name = name
+        """Its name, which VM.process() finds it by."""
+        self._state = state
+
+    @property
+    def pid(self) -> int:
+        """Its process ID on the VM, which is also its process group's."""
+        return self._state.pid
+
+    @property
+    def exit_code(self) -> int | None:
+        """Its exit status, or None if it was running when last seen.
+        A process killed by a signal has 128 plus the signal's number."""
+        return self._state.exit_code
+
+    def __repr__(self) -> str:
+        state = "lost" if self._state.lost else "running" if self.exit_code is None else f"exit_code={self.exit_code}"
+        return f"<{type(self).__name__} {self.name!r} on {self.vm.name!r} pid={self.pid} {state}>"
+
+    def __enter__(self) -> Process:
+        return self
+
+    def __exit__(
+        self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: TracebackType | None
+    ) -> None:
+        with contextlib.suppress(NotFoundError, ProcessLookupError):
+            self.kill()
+
+    def _check(self) -> int | None:
+        if self._state.lost:
+            raise ProcessLostError(self)
+        return self._state.exit_code
+
+    def poll(self) -> int | None:
+        """Its exit status, or None if it is still running. Raises
+        ProcessLostError if it ended without one."""
+        result = self.vm._script(sh(STATE_SCRIPT, self.name), ok=(MISSING,))
+        if result.exit_code == MISSING:
+            raise ProcessLookupError(f"no process {self.name} on VM {self.vm.name}")
+        self._state = process_state(result.stdout)
+        return self._check()
+
+    def wait(
+        self, *, timeout: float | None = None, check: bool = False, capture: bool = True, max_output: int = MAX_OUTPUT
+    ) -> CommandResult:
+        """Wait for it to exit, and return how it ended, with its output.
+
+        A lost connection does not matter: wait() reconnects until it knows.
+        timeout is in seconds: TimeoutError if it is still running then
+        (which it still is). check, capture, and max_output are as for
+        VM.run(); with capture=False, the result has no output.
+        Raises ProcessLostError if it ended without an exit status.
+        """
+        deadline = None if timeout is None else monotonic() + timeout
+        nonce = secrets.token_hex(8)
+        backoff = 0.1
+        while True:
+            remaining = None if deadline is None else deadline - monotonic()
+            if remaining is not None and remaining <= 0:
+                raise TimeoutError(f"process {self.name} on VM {self.vm.name} is still running")
+            try:
+                command = sh(WAIT_SCRIPT, self.name, nonce, "1" if capture else "")
+                result = self.vm._t.ssh(self.vm.name, command, max_output=max_output, timeout=remaining)
+                break
+            except CommandTimeoutError:
+                continue
+            except (CommandInterruptedError, NetworkError) as err:
+                if isinstance(err, OutputLimitError):
+                    raise
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 2.0)
+        if result.exit_code == 0 and result.stdout == f"{nonce} missing":
+            raise ProcessLookupError(f"no process {self.name} on VM {self.vm.name}")
+        if result.exit_code == 0 and result.stdout == f"{nonce} lost":
+            self._state.lost = True
+            raise ProcessLostError(self)
+        self._state.exit_code = result.exit_code
+        if check and result.exit_code != 0:
+            raise CommandError(result)
+        return result
+
+    def logs(self, *, tail: int | None = None) -> Logs:
+        """Its output so far; with tail, at most that many lines of each stream."""
+        if tail is not None and (not isinstance(tail, int) or isinstance(tail, bool) or tail < 0):
+            raise ValueError("tail must be a nonnegative int")
+        result = self.vm._script(
+            sh(LOGS_SCRIPT, self.name, "" if tail is None else str(tail)), UNLIMITED, ok=(MISSING,)
+        )
+        if result.exit_code == MISSING:
+            raise ProcessLookupError(f"no process {self.name} on VM {self.vm.name}")
+        return Logs(result.stdout, result.stderr)
+
+    def send_signal(self, sig: int | str) -> None:
+        """Send a signal, such as signal.SIGTERM or "HUP", to the process and
+        everything it started, if it is running."""
+        result = self.vm._script(sh(KILL_SCRIPT, self.name, signal_name(sig)), ok=(MISSING,))
+        if result.exit_code == MISSING:
+            raise ProcessLookupError(f"no process {self.name} on VM {self.vm.name}")
+
+    def terminate(self) -> None:
+        """Send SIGTERM to the process and everything it started."""
+        self.send_signal(signal.SIGTERM)
+
+    def kill(self) -> None:
+        """Send SIGKILL to the process and everything it started."""
+        self.send_signal(signal.SIGKILL)
+
+
 class Client:
     """An exe.dev API client.
 
@@ -638,6 +1047,9 @@ class Client:
     http_client is an httpx.Client to send requests with, for proxies,
     custom TLS, or tests. The SDK does not close a client it was given.
 
+    A request refused for exceeding the rate limit, which runs nothing, is
+    retried up to max_retries times, with backoff.
+
     Use it as a context manager, or call close(), to release connections.
     """
 
@@ -647,11 +1059,12 @@ class Client:
         *,
         base_url: str = DEFAULT_BASE_URL,
         http_client: httpx.Client | None = None,
+        max_retries: int = 5,
     ) -> None:
         token = token if token is not None else os.environ.get("EXE_TOKEN")
         if not token:
             raise ExeError("an exe.dev API token is required: pass token= or set EXE_TOKEN")
-        self._t = _Transport(token, base_url, http_client)
+        self._t = _Transport(token, base_url, http_client, max_retries)
         self.domain = _Domain(self._t)
         self.ssh_key = _SshKey(self._t)
         self.integrations = _Integrations(self._t)
@@ -676,8 +1089,8 @@ class Client:
         self.close()
 
     def vm(self, name: str) -> VM:
-        """The VM with this name, without a request. refresh() fetches its attributes."""
-        return VM(self._t, VMInfo(vm_name(name)))
+        """The VM with this name. NotFoundError if there is none. Requires ls permission."""
+        return VM(self._t, _find(self._t, vm_name(name)))
 
     def vms(self, pattern: str | None = None) -> list[VM]:
         """Your VMs; with a pattern such as ``"web-*"``, those it matches. Requires ls permission."""
@@ -717,7 +1130,6 @@ class Client:
         integrations: Sequence[str] | None = None,
         memory: int | str | None = None,
         name: str | None = None,
-        no_email: bool = False,
         no_pool: bool = False,
         pool: str | None = None,
         prompt: str | None = None,
@@ -725,8 +1137,10 @@ class Client:
         setup_script: str | None = None,
         standalone: bool = False,
         tags: Sequence[str] | None = None,
+        email: bool = False,
         wait_until: WaitUntil = "ssh",
         timeout: float | None = None,
+        keep_on_failure: bool = False,
     ) -> VM:
         """Create a VM. By default, it returns once the VM runs commands.
 
@@ -739,29 +1153,30 @@ class Client:
             env: environment variable in KEY=VALUE format (can be specified multiple
                 times)
             image: container image (server default: exeuntu)
-            integrations: integration name to attach (can be specified multiple times or
-                comma-separated)
+            integrations: integration name to attach
             memory: memory allocation (e.g., 4, 4GB, 8G)
             name: VM name (auto-generated if not specified)
-            no_email: do not send email notification
             no_pool: use ordinary placement (not available on plans that place new VMs
                 in pools)
-            pool: create the VM in one of your team's pools (see 'pool list')
+            pool: create the VM in one of your team's pools (see ``exe.pool.list()``)
             prompt: initial prompt to send to Shelley after VM creation (requires an
-                image with Shelley, like exeuntu); use /dev/stdin to read from stdin
+                image with Shelley, like exeuntu)
             registry_auth: private container registry credentials as USERNAME:PASSWORD
-                (e.g. octocat:ghp_xxx) for the registry hosting --image
-            setup_script: setup script to run on first boot (max 10KiB); supports \\n for
-                newlines; use /dev/stdin to pipe from stdin
+                (e.g. octocat:ghp_xxx) for the registry hosting ``image``
+            setup_script: setup script to run on first boot (max 10KiB)
             standalone: create a standalone VM with its own reserved capacity (requires
                 a plan with standalone VMs and team approval)
-            tags: tag to add to the VM (can be specified multiple times or
-                comma-separated)
+            tags: tag to add to the VM
+            email: email you about the VM, as the command line does. By default, it does
+                not.
             wait_until: "ssh" (the default) returns once the VM runs commands; "setup"
                 also waits for its setup script to finish, and succeed; "created"
                 returns at once. Waiting needs ssh permission, and raises VMReadyError
                 if the VM does not become ready.
             timeout: seconds to wait for readiness; by default 60, or 600 for "setup".
+            keep_on_failure: keep a VM that does not become ready, for debugging:
+                VMReadyError.vm is it. By default, it is deleted, as it is when the wait
+                is interrupted.
         """
         check_ready(wait_until, timeout)
         result = self._t.call(
@@ -776,20 +1191,19 @@ class Client:
                 ("integration", "repeated", integrations),
                 ("memory", "string", memory),
                 ("name", "string", name),
-                ("no-email", "bool", no_email or None),
                 ("no-pool", "bool", no_pool or None),
                 ("pool", "string", pool),
                 ("prompt", "string", prompt),
                 ("registry-auth", "string", registry_auth),
-                ("setup-script", "string", setup_script),
+                ("setup-script", "string", setup_script.replace("\\", "\\\\") if setup_script is not None else None),
                 ("standalone", "bool", standalone or None),
                 ("tag", "repeated", tags),
+                ("no-email", "bool", None if email else True),
             ],
             json=True,
         )
         vm = VM(self._t, vm_info(result, "new"), owned=True)
-        vm._ready(wait_until, timeout)
-        return vm
+        return vm._created(wait_until, timeout, keep_on_failure)
 
     def whoami(self) -> t.WhoamiResponse:
         """Show user information (email, keys, etc).
@@ -957,7 +1371,7 @@ class _Integrations:
     ) -> Any:
         """Add a new integration.
 
-        Credential value flags (keys, tokens, passwords, bearer tokens, and webhook URLs) accept - to read from stdin.
+
 
         CLI: ``integrations add <type> [--default | --name=<name> [--team] [args...]]``
 
@@ -965,27 +1379,25 @@ class _Integrations:
             act_as_user: authenticate as your GitHub user instead of the exe.dev app
                 (github only); pushes and API calls are attributed to your GitHub
                 account
-            attach: attach to a spec (vm:<name>, tag:<name>, or auto:all); can be
-                repeated
-            bearer: bearer token (shorthand for --header="Authorization:Bearer TOKEN";
-                combines with --header)
+            attach: attach to a spec (vm:<name>, tag:<name>, or auto:all)
+            bearer: bearer token (shorthand for ``headers=["Authorization:Bearer
+                TOKEN"]``; combines with ``headers``)
             comment: optional free-form comment stored with the integration
             default: install the canonical reflection integration with all fields;
-                attaches to auto:all unless --attach=vm:<name> is supplied; no other
-                customization
+                attaches to auto:all unless ``attach=["vm:<name>"]`` is supplied; no
+                other customization
             fields: comma-separated reflection fields to expose (email, integrations,
                 tags, comment, default_port); 'all' exposes every field including ones
                 added in the future; 'none' disables every field (server default: all)
-            for_: time-box every --attach to a duration from now (e.g. 2h, 45m); access
-                lapses automatically
-            headers: header to inject (e.g. X-Auth:secret); can be repeated
+            for_: time-box every ``attach`` to a duration from now (e.g. 2h, 45m);
+                access lapses automatically
+            headers: header to inject (e.g. X-Auth:secret)
             host_keys: host keys for ssh-key: authorized_keys or known_hosts lines
-                (hostnames are ignored), or '*' for any; can be repeated; one - reads
-                them piped in, e.g. from ssh-keyscan
-            name: integration name (required unless --default)
+                (hostnames are ignored), or '*' for any
+            name: integration name (required unless ``default=True``)
             no_auth: create an endpoint integration with no injected authentication
             peer: authenticate with a generated API key scoped to the target VM;
-                combines with --header/--bearer
+                combines with ``headers``/``bearer``
             readonly: restrict the integration to read access (github only); git push
                 and write API calls are rejected
             repository: GitHub repository in owner/repo format (required for github)
@@ -1060,24 +1472,23 @@ class _Integrations:
     ) -> Any:
         """Edit an integration.
 
-        Credential value flags (keys, tokens, passwords, bearer tokens, and webhook URLs) accept - to read from stdin.
+
 
         CLI: ``integrations edit <name> [--team] [args...]``
 
         Args:
             act_as_user: authenticate as your GitHub user instead of the exe.dev app
                 (github only)
-            bearer: bearer token (shorthand for --header="Authorization:Bearer TOKEN";
-                combines with --header)
+            bearer: bearer token (shorthand for ``headers=["Authorization:Bearer
+                TOKEN"]``; combines with ``headers``)
             clear_header: remove injected headers for http-proxy
             comment: free-form comment stored with the integration
             fields: comma-separated reflection fields to expose (email, integrations,
                 tags, comment, default_port); 'all' exposes every field including ones
                 added in the future; 'none' disables every field
-            headers: header to inject for http-proxy; can be repeated; replaces all
-                existing headers
-            host_keys: replacement host keys for ssh-key; replaces the whole list; can
-                be repeated; one - reads them piped in
+            headers: header to inject for http-proxy; replaces all existing headers
+            host_keys: replacement host keys for ssh-key; replaces the whole list; one -
+                reads them piped in
             no_auth: remove injected authentication for http-proxy
             readonly: restrict the integration to read access (github only)
             repository: GitHub repository in owner/repo format
@@ -1127,9 +1538,9 @@ class _Integrations:
         You can attach the same integration multiple times with different specs.
         Team integrations only support tag:<tag-name>.
 
-        A grant can be time-boxed with --for <duration> or --until <RFC3339>;
+        A grant can be time-boxed with ``for_=<duration>`` or ``until=<RFC3339>``;
         when it lapses, access stops immediately, with nothing to revoke.
-        Re-attaching the same spec with a new --for/--until extends or shortens it.
+        Re-attaching the same spec with a new ``for_``/``until`` extends or shortens it.
 
         CLI: ``integrations attach <name> <spec> [--team] [--for <duration> | --until <time>]``
 
@@ -1624,13 +2035,13 @@ class _Pool:
         return self._t.call("pool hosts", [])
 
     def list(self, pool_name: str | None = None, *, range: str | None = None, usage: bool = False) -> Any:
-        """List your team's pools, or show live or historical usage with --usage.
+        """List your team's pools, or show live or historical usage with ``usage=True``.
 
         CLI: ``pool list [pool-name] [--usage [--range=live|24h|7d|30d]]``
 
         Args:
-            range: statistics range: live, 24h, 7d, or 30d (requires --usage) (server
-                default: live)
+            range: statistics range: live, 24h, 7d, or 30d (requires ``usage=True``)
+                (server default: live)
             usage: show live or historical CPU and starvation statistics
         """
         return self._t.call(
@@ -1651,7 +2062,7 @@ class _Pool:
         return self._t.call("pool adopt", [], [("pool", "string", pool), ("vm", "string", vm)])
 
     def detach(self, *, poolless: bool = False, vm: str | None = None) -> Any:
-        """Detach a VM from its pool into its own standalone capacity (--poolless leaves it outside any pool).
+        """Detach a VM from its pool into its own standalone capacity (``poolless=True`` leaves it outside any pool).
 
         CLI: ``pool detach --vm=<vm-name> [--poolless]``
 
@@ -1678,9 +2089,9 @@ class _Pool:
         CLI: ``pool resize <name> --cpus=N | pool resize <name> --max-vms=N [--force]``
 
         Args:
-            cpus: new pool size in vCPUs (required unless --max-vms is set; even, from 2
-                up to the placement limit)
-            force: allow --max-vms below the current VM count (does not stop or evict
+            cpus: new pool size in vCPUs (required unless ``max_vms`` is set; even, from
+                2 up to the placement limit)
+            force: allow ``max_vms`` below the current VM count (does not stop or evict
                 VMs)
             max_vms: maximum VMs in the pool (Work: at most 25 per vCPU, up to 1000)
         """
@@ -1702,7 +2113,7 @@ class _Pool:
         return self._t.call("pool rename", [old_name, new_name])
 
     def delete(self, name: str) -> Any:
-        """Delete a pool (refused while it has VMs; --force detaches them).
+        """Delete a pool (refused while it has VMs; ``force`` detaches them).
 
         CLI: ``pool delete <name> [--force]``
         """
@@ -2180,7 +2591,7 @@ class _VMShare:
         qr: bool = False,
         root: bool = False,
     ) -> t.ShareAddResponse:
-        """Share VM with a user via email, or grant shell access with --root.
+        """Share VM with a user via email, or grant shell access with ``root=True``.
 
         CLI: ``share add <vm> <email|team> [--root] [--message='...']``
 
@@ -2204,7 +2615,7 @@ class _VMShare:
         return result
 
     def remove(self, email: str, *, root: bool = False) -> t.ShareRemoveResponse:
-        """Revoke a user's access to a VM, or downgrade shell access to web with --root.
+        """Revoke a user's access to a VM, or downgrade shell access to web with ``root=True``.
 
         CLI: ``share remove <vm> <email|team> [--root]``
 

@@ -144,7 +144,7 @@ class NewResponse(TypedDict):
     vscode_url: NotRequired[str]
     xterm_url: NotRequired[str]
     comment: NotRequired[str]
-    """The --comment the VM was created with; absent when there is none."""
+    """The ``comment`` the VM was created with; absent when there is none."""
     pool_id: NotRequired[str]
     standalone: NotRequired[bool]
     error: NotRequired[str]
@@ -166,7 +166,7 @@ class CpResponse(TypedDict):
     ssh_user: NotRequired[str]
     https_url: str
     tags: list[str]
-    """The copy's tags: the source's, unless --copy-tags=false."""
+    """The copy's tags: the source's, unless ``copy_tags=False``."""
     elapsed: float
     """How long the copy took, in seconds."""
     pool_id: NotRequired[str]
@@ -241,15 +241,15 @@ class ResizeResponse(TypedDict):
 
     vm_name: str
     old_memory: NotRequired[float]
-    """With --memory or --cpu. A change takes effect after a restart."""
+    """With ``memory`` or ``cpu``. A change takes effect after a restart."""
     new_memory: NotRequired[float]
     old_cpus: NotRequired[float]
     new_cpus: NotRequired[float]
     disk_old_bytes: NotRequired[float]
-    """With --disk within the self-serve limit: the disk has grown."""
+    """With ``disk`` within the self-serve limit: the disk has grown."""
     disk_new_bytes: NotRequired[float]
     disk_resize_pending_approval: NotRequired[Literal[True]]
-    """With --disk above the self-serve limit: support must approve the size,
+    """With ``disk`` above the self-serve limit: support must approve the size,
     and the disk stays at disk_capacity_bytes until then.
     """
     disk_capacity_bytes: NotRequired[float]
@@ -427,7 +427,7 @@ class ShareInvite(TypedDict):
     shared_with: str
     url: str
     message: str
-    """"Invitation sent", or "Share created" with --no-email."""
+    """"Invitation sent", or "Share created" when no email was sent."""
 
 
 class ShareTeamChange(TypedDict):

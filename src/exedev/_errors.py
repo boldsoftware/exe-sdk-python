@@ -28,8 +28,10 @@ __all__ = [
     "NotFoundError",
     "OutputLimitError",
     "PermissionDeniedError",
+    "ProcessLostError",
     "ProtocolError",
     "RateLimitError",
+    "VMNotRunningError",
     "VMReadyError",
     "VMSetupError",
 ]
@@ -74,7 +76,16 @@ class NotFoundError(APIError):
 
 
 class RateLimitError(APIError):
-    """429: too many requests. Retry later."""
+    """429: too many requests, even after the client's retries (see max_retries)."""
+
+
+class VMNotRunningError(APIError):
+    """422: the VM is not running, so it cannot run commands. It may be paused
+    (resume() it) or stopped (restart() it)."""
+
+    def __init__(self, vm: str, body: str) -> None:
+        super().__init__("ssh", 422, body)
+        self.args = (f"exe.dev API error (422) during ssh: VM {vm} is not running",)
 
 
 _API_ERRORS: dict[int, type[APIError]] = {
@@ -88,6 +99,18 @@ _API_ERRORS: dict[int, type[APIError]] = {
 def api_error(operation: str, status: int, body: str) -> APIError:
     """The APIError subclass for status."""
     return _API_ERRORS.get(status, APIError)(operation, status, body)
+
+
+def ssh_error(vm: str, status: int, body: str) -> APIError:
+    """The APIError for an ssh command that did not start. /exec reports a
+    missing or stopped VM as 422, with the error text matched here."""
+    if status == 422:
+        reason = error_text(body) or ""
+        if reason == f'VM "{vm}" not found':
+            return NotFoundError("ssh", 404, body)
+        if reason.startswith(f'VM "{vm}" is not running'):
+            return VMNotRunningError(vm, body)
+    return api_error("ssh", status, body)
 
 
 class NetworkError(ExeError):
@@ -166,7 +189,8 @@ class CommandInterruptedError(ExeError):
 
     The connection ended, or the VM did not report the exit status, before
     the command finished. It may have finished, or may still have been
-    running when the connection closed (which stops it). Do not blindly retry
+    running when the connection closed (which stops it, and what it started).
+    Do not blindly retry
     a command that is not safe to run twice. The output captured before the
     interruption is here; it is only a prefix.
     """
@@ -212,17 +236,27 @@ class OutputLimitError(CommandInterruptedError):
 
 class CommandTimeoutError(CommandInterruptedError, TimeoutError):
     """run(timeout=...): the command did not finish in time, so the SDK closed
-    the connection, which stops it."""
+    the connection, which stops it and every process it started."""
+
+
+class ProcessLostError(ExeError):
+    """A process started with spawn() ended without an exit status: the VM
+    restarted, or something killed the process that was watching it."""
+
+    def __init__(self, process: Any) -> None:
+        super().__init__(f"process {process.name} on VM {process.vm.name} ended without an exit status")
+        self.process = process
 
 
 class VMReadyError(ExeError):
-    """A VM did not become ready. The VM is not deleted: it is ``vm``.
+    """A VM did not become ready.
 
+    new() and copy() delete the VM first, unless keep_on_failure is true.
     __cause__ is what the last attempt ran into.
     """
 
     vm: Any
-    """The VM, which still exists. Inspect it, retry, or delete it."""
+    """The VM. Unless new() or copy() deleted it, inspect it, retry, or delete it."""
 
     def __init__(self, vm: Any, failure: str) -> None:
         super().__init__(f"VM {vm.name} {failure}")

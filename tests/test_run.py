@@ -7,22 +7,31 @@ import shlex
 
 import httpx
 import pytest
-from conftest import Chunks, error, frame, ndjson, ran, streaming
+from conftest import Chunks, Server, error, frame, ndjson, ran, streaming
 
 import exedev
+from exedev import _wire
 
 
 def run_server(api, *answers):
     """A client whose VM "worker" answers each run with the next answer."""
     queue = list(answers)
-    exe, server = api.client(lambda _: queue.pop(0))
-    return exe.vm("worker"), server
+    _, vm, server = api.vm(lambda _: queue.pop(0))
+    return vm, server
+
+
+def async_vm(handler):
+    """An AsyncClient's VM "worker", made in the running event loop."""
+    transport = httpx.MockTransport(Server(handler))
+    exe = exedev.AsyncClient("tok", http_client=httpx.AsyncClient(transport=transport))
+    return exe.vm("worker")
 
 
 def test_run(api):
     vm, server = run_server(api, ran(b"hi \xc3\xa9\x00\xff\n", b"warning\n", 7))
     result = api(vm.run("echo hello"))
-    assert server.commands == ["ssh worker 'echo hello'"]
+    assert server.commands == ["ssh worker run 'echo hello'"]
+    assert server.raw == ["ssh worker " + shlex.quote(_wire.sh(_wire.RUN_SCRIPT, "echo hello"))]
     assert server.requests[0].headers["Accept"] == "application/json, application/x-ndjson"
     assert result == exedev.CommandResult(7, b"hi \xc3\xa9\x00\xff\n", b"warning\n")
     assert result.stdout == "hi é\x00\ufffd\n"
@@ -37,10 +46,10 @@ def test_run_argv(api):
     api(vm.run("ls", cwd="/srv/my app", env={"A": "1", "B": "it's"}))
     # The /exec body is a command line; its ssh command is another.
     first, second = (shlex.split(command) for command in server.commands)
-    assert first == ["ssh", "worker", "cat 'my file' '$HOME'"]
-    assert second[:2] == ["ssh", "worker"]
-    assert shlex.split(second[2]) == ["cd", "/srv/my app", "||", "exit;", "export", "A=1;", "export", "B=it's;", "ls"]
-    assert second[2] == "cd '/srv/my app' || exit; export A=1; export B='it'\"'\"'s'; ls"
+    assert first == ["ssh", "worker", "run", "cat 'my file' '$HOME'"]
+    assert second[:3] == ["ssh", "worker", "run"]
+    assert shlex.split(second[3]) == ["cd", "/srv/my app", "||", "exit;", "export", "A=1;", "export", "B=it's;", "ls"]
+    assert second[3] == "cd '/srv/my app' || exit; export A=1; export B='it'\"'\"'s'; ls"
 
 
 def test_run_rejects_bad_commands(api):
@@ -92,26 +101,42 @@ def collector(api, log, name, fail_on=None):
 
 
 def test_callbacks(api):
-    # é is split across frames; the callback sees whole characters.
-    vm, _ = run_server(
-        api, ndjson(frame(stdout=b"a\xc3"), frame(stderr=b"err"), frame(stdout=b"\xa9b"), frame(exit_code=0), split=7)
-    )
+    # Callbacks see whole lines, without line endings, and whole characters:
+    # é is split across frames.
+    frames = [
+        frame(stdout=b"one\ntw"),
+        frame(stderr=b"err\n"),
+        frame(stdout=b"o\r\nthr\xc3"),
+        frame(stdout=b"\xa9e"),
+        frame(exit_code=0),
+    ]
+    vm, _ = run_server(api, ndjson(*frames, split=7))
     log = []
     result = api(vm.run("x", on_stdout=collector(api, log, "out"), on_stderr=collector(api, log, "err")))
-    assert log == [("out", "a"), ("err", "err"), ("out", "éb")]
-    assert result.stdout == "aéb"
+    assert log == [("out", "one"), ("err", "err"), ("out", "two"), ("out", "thrée")]
+    assert result.stdout == "one\ntwo\r\nthrée"
+
+
+def test_long_lines_arrive_in_pieces(api):
+    vm, _ = run_server(api, ran(b"x" * (_wire.MAX_LINE * 2 + 1) + b"\n"))
+    log = []
+    api(vm.run("x", on_stdout=collector(api, log, "out")))
+    assert [len(text) for _, text in log] == [_wire.MAX_LINE, _wire.MAX_LINE, 1]
 
 
 def test_sync_callbacks_in_async_code():
     log = []
-    transport = httpx.MockTransport(lambda _: ran(b"out"))
-    exe = exedev.AsyncClient("tok", http_client=httpx.AsyncClient(transport=transport))
-    asyncio.run(exe.vm("worker").run("x", on_stdout=log.append))
+
+    async def main():
+        vm = await async_vm(lambda _: ran(b"out"))
+        await vm.run("x", on_stdout=log.append)
+
+    asyncio.run(main())
     assert log == ["out"]
 
 
 def test_callback_errors_stop_the_command(api):
-    response = ndjson(frame(stdout=b"one"), frame(stdout=b"two"), frame(stdout=b"three"), frame(exit_code=0))
+    response = ndjson(frame(stdout=b"one\n"), frame(stdout=b"two\n"), frame(stdout=b"three\n"), frame(exit_code=0))
     vm, _ = run_server(api, response)
     log = []
     with pytest.raises(RuntimeError, match="stop"):
@@ -124,7 +149,7 @@ def test_invalid_utf8_at_the_end_is_replaced(api):
     vm, _ = run_server(api, ran(b"ok\xc3"))
     log = []
     api(vm.run("x", on_stdout=collector(api, log, "out")))
-    assert log == [("out", "ok"), ("out", "\ufffd")]
+    assert log == [("out", "ok\ufffd")]
 
 
 def test_output_limit(api):
@@ -213,6 +238,38 @@ def test_api_errors(api):
         api(vm.run("x"))
 
 
+def test_missing_vm(api):
+    # As delete() does, whatever status /exec uses for it.
+    vm, _ = run_server(api, error(422, 'VM "worker" not found'), error(422, 'VM "other" not found'))
+    with pytest.raises(exedev.NotFoundError) as info:
+        api(vm.run("x"))
+    assert info.value.status == 404
+    with pytest.raises(exedev.APIError) as other:
+        api(vm.run("x"))
+    assert type(other.value) is exedev.APIError
+
+
+def test_stopped_vm(api):
+    message = 'VM "worker" is not running.\n\nTo see why it failed, run:\n  ssh exe.dev vm-logs worker'
+    vm, _ = run_server(api, error(422, message))
+    with pytest.raises(exedev.VMNotRunningError) as info:
+        api(vm.run("x"))
+    assert isinstance(info.value, exedev.APIError)
+    assert info.value.status == 422
+    assert str(info.value) == "exe.dev API error (422) during ssh: VM worker is not running"
+
+
+def test_large_commands_are_uploaded(api):
+    program = "print('" + "x" * 70000 + "')"
+    vm, server = run_server(api, ran(), ran(b"x"))
+    assert api(vm.run(["python3", "-c", program])).stdout == "x"
+    write, run = (shlex.split(command) for command in server.commands)
+    assert write[:3] == ["ssh", "worker", "write"]
+    path = write[3]
+    assert path.startswith("/tmp/.exedev-command-")
+    assert run == ["ssh", "worker", "run", _wire.UPLOADED_COMMAND.format(path=path)]
+
+
 def test_timeout(api, clock):
     class Slow(Chunks):
         def __iter__(self):
@@ -246,10 +303,10 @@ def test_cancellation_closes_the_stream():
 
     stream = Endless([])
     response = streaming(stream)
-    exe = exedev.AsyncClient("tok", http_client=httpx.AsyncClient(transport=httpx.MockTransport(lambda _: response)))
 
     async def main():
-        task = asyncio.create_task(exe.vm("worker").run("sleep infinity"))
+        vm = await async_vm(lambda _: response)
+        task = asyncio.create_task(vm.run("sleep infinity"))
         await started.wait()
         task.cancel()
         with pytest.raises(asyncio.CancelledError):

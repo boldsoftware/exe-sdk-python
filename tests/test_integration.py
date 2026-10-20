@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import random
 import time
 from pathlib import Path
 
@@ -97,9 +98,9 @@ def test_run_argv_cwd_env(vm):
 
 @skip_ssh
 def test_streaming_and_limits(vm):
-    chunks: list[str] = []
-    result = vm.run("echo a; echo b", capture=False, on_stdout=chunks.append)
-    assert (result.exit_code, result.stdout, "".join(chunks)) == (0, "", "a\nb\n")
+    lines: list[str] = []
+    result = vm.run("echo a; echo b", capture=False, on_stdout=lines.append)
+    assert (result.exit_code, result.stdout, lines) == (0, "", ["a", "b"])
     assert vm.run("head -c 1024 /dev/zero").stdout_bytes == bytes(1024)
     with pytest.raises(exedev.OutputLimitError):
         vm.run("head -c 16384 /dev/zero", max_output=128)
@@ -109,9 +110,81 @@ def test_streaming_and_limits(vm):
 def test_timeout(vm):
     start = time.monotonic()
     with pytest.raises(exedev.CommandTimeoutError) as info:
-        vm.run("echo started; sleep 60", timeout=3)
+        vm.run("echo started; sleep 61 & sleep 62", timeout=3)
     assert time.monotonic() - start < 20
     assert info.value.stdout == "started\n"
+    # Everything the command started stops with it.
+    deadline = time.monotonic() + 10
+    while vm.run("pgrep -f 'sleep 6[12]'").exit_code == 0:
+        assert time.monotonic() < deadline, "the command's processes outlived its timeout"
+        time.sleep(0.5)
+
+
+@skip_ssh
+def test_login_environment(vm):
+    vm.write_file(".local/bin/hello-sdk", "#!/bin/sh\necho hello from PATH\n", mode=0o755)
+    assert vm.run("hello-sdk", check=True).stdout == "hello from PATH\n"
+
+
+@skip_ssh
+def test_large_commands(vm):
+    word = "x" * 100_000
+    assert vm.run(f"printf %s {word} | wc -c", check=True).stdout.strip() == "100000"
+
+
+@skip_ssh
+def test_files(vm, tmp_path):
+    vm.write_file("sdk/notes.txt", "héllo\n")
+    assert vm.read_file("sdk/notes.txt") == "héllo\n".encode()
+    data = random.Random(1).randbytes(300_000)
+    vm.write_file("/tmp/sdk.bin", data)
+    assert vm.read_file("/tmp/sdk.bin") == data
+    assert (
+        vm.run("sha256sum /tmp/sdk.bin", check=True).stdout.split()[0] == __import__("hashlib").sha256(data).hexdigest()
+    )
+    with pytest.raises(FileNotFoundError):
+        vm.read_file("sdk/missing")
+    src = tmp_path / "src"
+    (src / "pkg").mkdir(parents=True)
+    (src / "pkg" / "a.py").write_text("print('a')\n")
+    (src / ".git").mkdir()
+    (src / "run.sh").write_text("#!/bin/sh\necho ran\n")
+    (src / "run.sh").chmod(0o755)
+    vm.upload(src, "proj", exclude=[".git"])
+    assert vm.run("./proj/run.sh && ls -A proj", check=True).stdout == "ran\npkg\nrun.sh\n"
+    vm.download("proj", tmp_path / "back")
+    assert (tmp_path / "back" / "pkg" / "a.py").read_text() == "print('a')\n"
+    assert os.access(tmp_path / "back" / "run.sh", os.X_OK)
+
+
+@skip_ssh
+def test_spawn(exe, vm):
+    server = vm.spawn("echo serving; exec python3 -m http.server 8123", name="web")
+    assert server.poll() is None
+    deadline = time.monotonic() + 30
+    while vm.run("curl -sf localhost:8123/ >/dev/null").exit_code != 0:
+        assert time.monotonic() < deadline, server.logs()
+        time.sleep(0.5)
+    # Found again, by another client.
+    with exedev.Client(token(), base_url=BASE_URL) as other:
+        found = other.vm(vm.name).process("web")
+        assert found.pid == server.pid
+        assert found.logs().stdout == "serving\n"
+        found.terminate()
+    result = server.wait(timeout=30)
+    assert result.exit_code != 0
+    job = vm.spawn("sleep 2; echo done", name="job")
+    assert job.wait(check=True).stdout == "done\n"
+    assert {p.name for p in vm.processes()} >= {"web", "job"}
+
+
+@skip_ssh
+def test_paused(vm):
+    vm.pause()
+    with pytest.raises(exedev.VMNotRunningError):
+        vm.run("true")
+    vm.resume()
+    assert vm.run("true").ok
 
 
 @skip_ssh
@@ -134,7 +207,7 @@ def test_async(exe, vm):
                 await task
         return seen
 
-    assert asyncio.run(main()) == ["async\n"]
+    assert asyncio.run(main()) == ["async"]
 
 
 def test_vms_and_refresh(exe, vm):
@@ -187,22 +260,30 @@ def test_rename(exe, vm):
 
 @skip_ssh
 def test_setup_failure(exe):
+    script = "#!/bin/sh\necho setup-output-marker\necho 'back\\slash'\nexit 3"
     with pytest.raises(exedev.VMSetupError) as info:
-        exe.new(name=NAMES["setup"], setup_script="#!/bin/sh\necho setup-output-marker\nexit 3", wait_until="setup")
+        exe.new(name=NAMES["setup"], setup_script=script, wait_until="setup")
     assert info.value.vm.name == NAMES["setup"]
     assert info.value.exit_code == 3
     assert "setup-output-marker" in info.value.output
-    info.value.vm.delete()
+    assert "back\\slash" in info.value.output
+    # new() deleted the VM it could not hand over.
+    with pytest.raises(exedev.NotFoundError):
+        exe.vm(NAMES["setup"])
 
 
 def test_delete(exe, vm):
     vm.delete()
     assert vm.name not in [v.name for v in exe.vms()]
+    with pytest.raises(exedev.NotFoundError):
+        exe.vm(vm.name)
+    with pytest.raises(exedev.NotFoundError):
+        vm.delete()
+    if SSH:
+        with pytest.raises(exedev.NotFoundError):
+            vm.run("true")
     with pytest.raises(exedev.APIError) as info:
-        exe.vm(NAMES["missing"]).delete()
-    assert info.value.status in (404, 422)
-    with pytest.raises(exedev.APIError) as info:
-        exe.vm(NAMES["missing"]).restart()
+        vm.restart()
     assert info.value.status == 422
     bulk = exe.delete(NAMES["missing"])
     assert (bulk["deleted"], bulk["failed"]) == ([], [NAMES["missing"]])

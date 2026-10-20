@@ -83,14 +83,16 @@ def test_positionals(api):
     api(exe.doc("https api", "proxy"))
     api(exe.team.add("a@example.com"))
     api(exe.team.add("a@example.com", "admin"))
-    api(exe.vm("worker").grant_support_root(False))
-    api(exe.vm("worker").share.port(8080))
-    api(exe.vm("worker").set_comment("-x"))
+    vm = api(exe.vm("worker"))
+    api(vm.grant_support_root(False))
+    api(vm.share.port(8080))
+    api(vm.set_comment("-x"))
     assert server.commands == [
         "doc",
         "doc 'https api' proxy",
         "team add a@example.com",
         "team add a@example.com admin",
+        "ls worker",
         "grant-support-root worker off",
         "share port worker 8080",
         "comment -- worker -x",
@@ -98,9 +100,9 @@ def test_positionals(api):
 
 
 def test_required_variadic(api):
-    exe, server = api.client(lambda _: "ok")
+    _, vm, server = api.vm(lambda _: "ok")
     with pytest.raises(TypeError, match="tag name"):
-        api(exe.vm("worker").tag())
+        api(vm.tag())
     assert server.commands == []
 
 
@@ -133,7 +135,7 @@ def test_json_results_must_be_json(api):
     ],
 )
 def test_api_errors(api, status, cls):
-    exe, _ = api.client(lambda _: error(status, "nope"))
+    exe, _ = api.client(lambda _: error(status, "nope"), max_retries=0)
     with pytest.raises(cls) as info:
         api(exe.whoami())
     err = info.value
@@ -143,6 +145,29 @@ def test_api_errors(api, status, cls):
     assert err.operation == "whoami"
     assert err.body == '{"error":"nope"}'
     assert str(err) == f"exe.dev API error ({status}) during whoami: nope"
+
+
+def test_rate_limits_are_retried(api, clock):
+    exe, server = api.client({"whoami": [error(429, "slow down")] * 3 + [{"email": "me@example.com"}]})
+    assert api(exe.whoami()) == {"email": "me@example.com"}
+    assert server.commands == ["whoami"] * 4
+    # Exponential backoff, with jitter.
+    for delay, backoff in zip(clock.sleeps, [0.5, 1, 2], strict=True):
+        assert backoff <= delay <= backoff * 1.5
+
+
+def test_rate_limit_retries_run_out(api, clock):
+    exe, server = api.client(lambda _: httpx.Response(429, json={"error": "slow down"}, headers={"Retry-After": "7"}))
+    with pytest.raises(exedev.RateLimitError):
+        api(exe.whoami())
+    assert len(server.commands) == 6
+    assert min(clock.sleeps) >= 7
+    exe, server = api.client(lambda _: error(429, "slow down"), max_retries=0)
+    with pytest.raises(exedev.RateLimitError):
+        api(exe.whoami())
+    assert len(server.commands) == 1
+    with pytest.raises(TypeError):
+        api.client({}, max_retries=-1)
 
 
 def test_api_error_messages_are_safe(api):
@@ -187,19 +212,51 @@ def test_vm_names_are_checked(api):
     exe, server = api.client(lambda _: {})
     for bad in ["", "-x", "a b", "a;b", "a/b"]:
         with pytest.raises(ValueError):
-            exe.vm(bad)
+            api(exe.vm(bad))
     assert server.commands == []
 
 
-def test_vm_makes_no_request(api):
-    exe, server = api.client(lambda _: {})
-    vm = exe.vm("worker")
-    assert vm.name == "worker"
-    assert vm.status is None
-    assert vm.ssh_dest is None
-    assert vm.tags == ()
-    assert repr(vm) == f"<{type(vm).__name__} 'worker'>"
-    assert server.commands == []
+def test_vm(api):
+    exe, server = api.client({"ls worker": VMS_WORKER, "ls gone": {"vms": []}})
+    vm = api(exe.vm("worker"))
+    assert server.commands == ["ls worker"]
+    assert (vm.name, vm.status, vm.ssh_dest, vm.https_url) == (
+        "worker",
+        "running",
+        "worker.exe.xyz",
+        "https://worker.exe.xyz",
+    )
+    assert (vm.tags, vm.comment, vm.region) == ((), "", "lax")
+    assert repr(vm) == f"<{type(vm).__name__} 'worker' status='running'>"
+    with pytest.raises(exedev.NotFoundError):
+        api(exe.vm("gone"))
+
+
+VMS_WORKER = {
+    "vms": [
+        # ls with a name lists VMs whose names start with it, too.
+        {"vm_name": "worker-2", "ssh_dest": "worker-2.exe.xyz", "https_url": "https://w2", "status": "paused"},
+        {
+            "vm_name": "worker",
+            "ssh_dest": "worker.exe.xyz",
+            "https_url": "https://worker.exe.xyz",
+            "status": "running",
+            "region": "lax",
+        },
+    ]
+}
+
+
+def test_url(api):
+    _, vm, _ = api.vm({})
+    assert vm.url() == "https://worker.exe.xyz/"
+    assert vm.url(3000) == "https://worker.exe.xyz:3000/"
+    assert vm.url(8080, "/api?x=1") == "https://worker.exe.xyz:8080/api?x=1"
+    for bad in [0, 70000, True, "80"]:
+        with pytest.raises(ValueError):
+            vm.url(bad)
+    with pytest.raises(ValueError):
+        vm.url(3000, "api")
 
 
 VMS = {
@@ -244,8 +301,9 @@ def test_vms_rejects_malformed_listings(api):
 def test_delete_many(api):
     result = {"deleted": ["a"], "failed": ["b"], "not_found": ["b"], "errors": {"b": "not found"}}
     exe, server = api.client({"rm a b": result})
-    assert api(exe.delete("a", exe.vm("b"), "a")) == result
-    assert server.commands == ["rm a b"]
+    b = api(exe.vm("b"))
+    assert api(exe.delete("a", b, "a")) == result
+    assert server.commands == ["ls b", "rm a b"]
 
 
 def test_delete_nothing(api):
