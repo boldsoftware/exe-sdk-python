@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import tomllib
+from pathlib import Path
 
 import httpx
 import pytest
@@ -328,3 +330,8 @@ def test_async_client_closes_its_http_client():
             return exe._t._http
 
     assert asyncio.run(main()).is_closed
+
+
+def test_version():
+    pyproject = tomllib.loads((Path(__file__).parent.parent / "pyproject.toml").read_text())
+    assert exedev.__version__ == pyproject["project"]["version"]

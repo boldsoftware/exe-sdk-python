@@ -52,7 +52,8 @@ def test_run_script_stops_everything_when_the_session_ends(tmp_path, login_shell
         assert not gone(pgid, 0.2)
         session.kill()
         session.wait()
-        assert gone(pgid)
+        # Promptly: a run() timeout should not run on for long.
+        assert gone(pgid, 0.7)
     finally:
         try:
             os.killpg(pgid, signal.SIGKILL)

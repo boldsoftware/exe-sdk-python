@@ -110,7 +110,7 @@ def describe(command: str) -> str:
         prefix = shlex.join(["sh", "-c", script, "sh"])
         if inner == prefix or inner.startswith(prefix + " "):
             rest = inner[len(prefix) + 1 :]
-            args = rest.split(" ") if re.fullmatch(r"[\w@%+=:,./ -]*", rest) else shlex.split(rest)
+            args = rest.split(" ") if re.fullmatch(r"[\w@%+=:,./ -]+", rest) else shlex.split(rest)
             return shlex.join(["ssh", match[1], name, *args])
     return command
 

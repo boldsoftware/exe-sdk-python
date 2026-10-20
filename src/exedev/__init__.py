@@ -11,6 +11,8 @@
 AsyncClient is the same API for asyncio.
 """
 
+from importlib.metadata import PackageNotFoundError, version
+
 from ._async import AsyncClient, AsyncProcess, AsyncVM
 from ._errors import (
     APIError,
@@ -32,6 +34,12 @@ from ._errors import (
 )
 from ._sync import VM, Client, Process
 from ._wire import CommandResult, Logs
+
+try:
+    __version__ = version("exedev")
+except PackageNotFoundError:  # Not installed, as in a source checkout.
+    __version__ = "0+unknown"
+del PackageNotFoundError, version
 
 __all__ = [
     "APIError",

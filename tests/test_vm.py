@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import shlex
+import signal
+import threading
+import time
 
 import httpx
 import pytest
@@ -174,6 +177,74 @@ def test_new_deletes_the_vm_when_cancelled():
     assert commands == ["new --no-email", "ssh worker true", "rm worker"]
 
 
+def interrupting(first: str, interrupts: int = 1):
+    """A handler for which a Ctrl-C arrives while the server runs first,
+    which creates the VM: it is done, but the response is yet to come."""
+    commands = []
+    main = threading.main_thread().ident
+    assert main is not None
+
+    def handle(request):
+        commands.append(request.content.decode())
+        if commands[-1] == first:
+            for _ in range(interrupts):
+                signal.pthread_kill(main, signal.SIGINT)
+                time.sleep(0.05)
+        if commands[-1].startswith("rm "):
+            return httpx.Response(200, json={"deleted": [commands[-1][3:]], "failed": []})
+        return httpx.Response(200, json=CP if first.startswith("cp ") else NEW)
+
+    return commands, handle
+
+
+def test_new_deletes_the_vm_when_interrupted_during_creation():
+    commands, handle = interrupting("new --no-email")
+    exe = exedev.Client("tok", http_client=httpx.Client(transport=httpx.MockTransport(handle)))
+    with pytest.raises(KeyboardInterrupt):
+        exe.new()
+    assert commands == ["new --no-email", "rm worker"]
+
+
+def test_copy_deletes_the_vm_when_interrupted_during_creation():
+    commands, handle = interrupting("cp worker")
+    exe = exedev.Client("tok", http_client=httpx.Client(transport=httpx.MockTransport(handle)))
+    vm = exedev.VM(exe._t, exedev._wire.vm_info(NEW, "new"))
+    with pytest.raises(KeyboardInterrupt):
+        vm.copy(flush=False)
+    assert commands == ["cp worker", "rm copy"]
+
+
+def test_a_second_interrupt_abandons_the_vm():
+    commands, handle = interrupting("new --no-email", interrupts=2)
+    exe = exedev.Client("tok", http_client=httpx.Client(transport=httpx.MockTransport(handle)))
+    with pytest.raises(KeyboardInterrupt):
+        exe.new()
+    time.sleep(0.2)
+    assert commands == ["new --no-email"]
+
+
+def test_new_deletes_the_vm_when_cancelled_during_creation():
+    commands = []
+
+    async def handle(request):
+        commands.append(request.content.decode())
+        if commands[-1] == "new --no-email":
+            await asyncio.sleep(0.05)
+        return httpx.Response(200, json=RM if commands[-1] == "rm worker" else NEW)
+
+    async def main():
+        exe = exedev.AsyncClient("tok", http_client=httpx.AsyncClient(transport=httpx.MockTransport(handle)))
+        task = asyncio.create_task(exe.new())
+        while not commands:
+            await asyncio.sleep(0.001)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(main())
+    assert commands == ["new --no-email", "rm worker"]
+
+
 def test_readiness_without_ssh_permission_fails_fast(api, clock):
     exe, server = api.client({"new --no-email": NEW, "ssh worker true": error(403, "forbidden"), "rm worker": RM})
     with pytest.raises(exedev.VMReadyError, match='use wait_until="created"'):
@@ -311,10 +382,10 @@ def test_only_new_vms_are_context_managers(api):
 
 
 def test_copy(api, clock):
-    _, vm, server = api.vm({"ssh worker sync": ran(), "cp --cpu=4 worker copy": CP, "ssh copy true": ran()})
+    _, vm, server = api.vm({"ssh worker flush": ran(), "cp --cpu=4 worker copy": CP, "ssh copy true": ran()})
     copy = api(vm.copy("copy", cpu=4))
     # It flushes the VM's writes to disk first, so that the copy has them.
-    assert server.commands == ["ssh worker sync", "cp --cpu=4 worker copy", "ssh copy true"]
+    assert server.commands == ["ssh worker flush", "cp --cpu=4 worker copy", "ssh copy true"]
     assert (copy.name, copy.ssh_dest, copy.https_url, copy.status, copy.tags) == (
         "copy",
         "copy.exe.xyz",
@@ -331,9 +402,9 @@ def test_copy_without_tags(api):
 
 
 def test_copy_flush_is_best_effort(api, clock):
-    _, vm, server = api.vm({"ssh worker sync": error(403, "no ssh"), "cp worker": CP})
+    _, vm, server = api.vm({"ssh worker flush": error(403, "no ssh"), "cp worker": CP})
     api(vm.copy(wait_until="created"))
-    assert server.commands == ["ssh worker sync", "cp worker"]
+    assert server.commands == ["ssh worker flush", "cp worker"]
 
 
 def test_delete(api):
@@ -392,6 +463,7 @@ def test_lifecycle(api, clock):
             "resume worker": {"vm_name": "worker", "status": "running", "cold_booted": "false"},
             "restart worker": {"status": "restarted", "vm_name": "worker"},
             "ssh worker true": [NOT_READY, ran()],
+            "ssh worker flush": ran(),
         }
     )
     api(vm.pause())
@@ -399,16 +471,30 @@ def test_lifecycle(api, clock):
     assert api(vm.resume())["cold_booted"] == "false"
     assert vm.status == "running"
     api(vm.restart(wait_until="created"))
-    api(vm.restart())
+    api(vm.restart(flush=False))
+    api(vm.pause(flush=False))
     assert server.commands == [
+        # Recent writes reach the disk before a pause, so copies of the
+        # paused VM have them, and before a restart, which loses the rest.
+        "ssh worker flush",
         "pause worker",
         "resume worker",
         "ssh worker true",
         "ssh worker true",
+        "ssh worker flush",
         "restart worker",
         "restart worker",
         "ssh worker true",
+        "pause worker",
     ]
+
+
+def test_flushing_is_best_effort(api):
+    _, vm, server = api.vm(
+        {"ssh worker flush": error(403, "no ssh"), "pause worker": {"vm_name": "worker", "status": "paused"}}
+    )
+    api(vm.pause())
+    assert server.commands == ["ssh worker flush", "pause worker"]
 
 
 def test_tags_and_comment(api):
@@ -457,7 +543,8 @@ def test_resize_and_restart(api, clock):
             "resize --memory=8G worker": {"vm_name": "worker", "memory": "8G"},
             "restart worker": {"status": "restarted", "vm_name": "worker"},
             "ssh worker true": ran(),
+            "ssh worker flush": ran(),
         }
     )
     api(vm.resize(memory="8G", restart=True))
-    assert server.commands == ["resize --memory=8G worker", "restart worker", "ssh worker true"]
+    assert server.commands == ["resize --memory=8G worker", "ssh worker flush", "restart worker", "ssh worker true"]

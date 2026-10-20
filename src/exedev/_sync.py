@@ -16,7 +16,7 @@ import signal
 import stat
 import time
 from collections.abc import Callable, Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 from time import monotonic
@@ -49,6 +49,7 @@ from ._errors import (
 from ._wire import (
     DEFAULT_BASE_URL,
     DOWNLOAD_SCRIPT,
+    FLUSH_SCRIPT,
     HEADERS,
     IS_DIRECTORY,
     KILL_SCRIPT,
@@ -95,6 +96,7 @@ from ._wire import (
     remote_path,
     required,
     retry_delay,
+    in_thread,
     rm_result,
     setup_state,
     sh,
@@ -145,6 +147,26 @@ class _Transport:
             response.close()
             time.sleep(retry_delay(response, attempt))
             attempt += 1
+
+    def create(self, path: Literal["new", "cp"], args: Sequence[Arg], flags: Sequence[Flag]) -> VMInfo:
+        """Run new or cp: the VM it created. Interrupted (by cancellation, or
+        KeyboardInterrupt) before the response, it waits for the response
+        anyway, deletes the VM, and re-raises: no one else would know of it.
+        Interrupted again, it gives up."""
+        request: Future[Any] = Future()
+        try:
+            in_thread(request, lambda: self.call(path, args, flags, json=True))
+            result = request.result()
+        except Exception:
+            raise
+        except BaseException:
+            if request.cancel():  # It never started.
+                raise
+            with contextlib.suppress(Exception):
+                info = vm_info(request.result(), path)
+                self.documents("rm", [info.name])
+            raise
+        return vm_info(result, path)
 
     def documents(
         self, path: str, args: Sequence[Arg] = (), flags: Sequence[Flag] = ()
@@ -303,7 +325,7 @@ class VM:
 
     @property
     def created_at(self) -> datetime | None:
-        """When the VM was created; None until listed (see refresh())."""
+        """When the VM was created; None if the server did not say (see refresh())."""
         return self._info.created_at
 
     @property
@@ -674,7 +696,7 @@ class VM:
     def _flush(self) -> None:
         """Flush the VM's recent writes to its disk, if it is running. Best effort."""
         with contextlib.suppress(ExeError):
-            self._t.ssh(self.name, "sync", capture=False, timeout=60)
+            self._t.ssh(self.name, sh(FLUSH_SCRIPT), capture=False, timeout=60)
 
     def delete(self) -> None:
         """Delete the VM. A VM that does not exist raises NotFoundError.
@@ -688,7 +710,13 @@ class VM:
         if summary["failed"] or len(summary["deleted"]) != 1:
             raise api_error("rm", 404 if summary.get("not_found") else 422, body)
 
-    def restart(self, *, wait_until: WaitUntil = "ssh", timeout: float | None = None) -> t.RestartResponse:
+    def restart(
+        self,
+        *,
+        flush: bool = True,
+        wait_until: WaitUntil = "ssh",
+        timeout: float | None = None,
+    ) -> t.RestartResponse:
         """Restart a VM.
 
         CLI: ``restart <vmname>``
@@ -696,6 +724,9 @@ class VM:
         Tag-scoped API keys may run this command.
 
         Args:
+            flush: first flush the VM's recent writes to its disk (best effort: it needs
+                ssh permission, and a running VM), so that it still has them after the
+                restart.
             wait_until: "ssh" (the default) returns once the VM runs commands; "setup"
                 also waits for its setup script to finish, and succeed; "created"
                 returns at once. Waiting needs ssh permission, and raises VMReadyError
@@ -703,17 +734,26 @@ class VM:
             timeout: seconds to wait for readiness; by default 60, or 600 for "setup".
         """
         check_ready(wait_until, timeout)
+        if flush:
+            self._flush()
         result: t.RestartResponse = self._t.call("restart", [self.name], json=True)
         self._ready(wait_until, timeout)
         return result
 
-    def pause(self) -> t.PauseResponse:
+    def pause(self, *, flush: bool = True) -> t.PauseResponse:
         """Pause a VM (snapshot RAM to disk, free its CPU and memory).
 
         CLI: ``pause <vmname>``
 
         Tag-scoped API keys may run this command.
+
+        Args:
+            flush: first flush the VM's recent writes to its disk (best effort: it needs
+                ssh permission, and a running VM), so that copies of the paused VM have
+                them.
         """
+        if flush:
+            self._flush()
         result: t.PauseResponse = self._t.call("pause", [self.name], json=True)
         self._absorb(result)
         return result
@@ -807,8 +847,8 @@ class VM:
             pool: create the copy in one of your team's pools (see ``exe.pool.list()``)
             standalone: create the copy as a standalone VM with its own reserved
                 capacity (requires a plan with standalone VMs and team approval)
-            flush: first flush the VM's recent writes to its disk, so that the copy has
-                them. Best effort: it needs ssh permission, and a running VM.
+            flush: first flush the VM's recent writes to its disk (best effort: it needs
+                ssh permission, and a running VM), so that the copy has them.
             wait_until: "ssh" (the default) returns once the VM runs commands; "setup"
                 also waits for its setup script to finish, and succeed; "created"
                 returns at once. Waiting needs ssh permission, and raises VMReadyError
@@ -821,7 +861,7 @@ class VM:
         check_ready(wait_until, timeout)
         if flush:
             self._flush()
-        result = self._t.call(
+        result = self._t.create(
             "cp",
             [self.name, name],
             [
@@ -832,9 +872,8 @@ class VM:
                 ("pool", "string", pool),
                 ("standalone", "bool", standalone or None),
             ],
-            json=True,
         )
-        vm = VM(self._t, vm_info(result, "cp"), owned=True)
+        vm = VM(self._t, result, owned=True)
         return vm._created(wait_until, timeout, keep_on_failure)
 
     def resize(
@@ -935,7 +974,8 @@ class Process:
 
     @property
     def pid(self) -> int:
-        """Its process ID on the VM, which is also its process group's."""
+        """Its process ID on the VM, which is also its process group's; 0 if
+        that is unknown, as it can be for a lost process."""
         return self._state.pid
 
     @property
@@ -1179,7 +1219,7 @@ class Client:
                 is interrupted.
         """
         check_ready(wait_until, timeout)
-        result = self._t.call(
+        result = self._t.create(
             "new",
             [],
             [
@@ -1200,9 +1240,8 @@ class Client:
                 ("tag", "repeated", tags),
                 ("no-email", "bool", None if email else True),
             ],
-            json=True,
         )
-        vm = VM(self._t, vm_info(result, "new"), owned=True)
+        vm = VM(self._t, result, owned=True)
         return vm._created(wait_until, timeout, keep_on_failure)
 
     def whoami(self) -> t.WhoamiResponse:

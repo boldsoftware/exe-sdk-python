@@ -20,7 +20,9 @@ import shlex
 import signal
 import sys
 import tarfile
+import threading
 from collections.abc import Awaitable, Callable, Coroutine, Generator, Iterable, Mapping, Sequence
+from concurrent.futures import Future
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from datetime import datetime
@@ -429,7 +431,8 @@ def _string_map(v: object) -> bool:
 RETRYABLE = re.compile(r"failed to (?:connect|dial|create session|run command on VM)", re.IGNORECASE)
 
 # Report exe-setup.service's state, whether a setup script is in place, and
-# on failure the end of its journal. exe-init puts /exe.dev/setup in place
+# on failure the end of the script's output (its unit's journal also holds
+# systemd's messages, and sudo's). exe-init puts /exe.dev/setup in place
 # before exessh answers, and the unit removes it once it has run. exessh can
 # answer before exe-init hands PID 1 to systemd, and then before systemd's
 # bus is up ("Failed to connect to bus"): both are "booting".
@@ -446,7 +449,7 @@ echo "$props"
 echo "SystemState=$(systemctl is-system-running 2>/dev/null)"
 if [ "$(systemctl show exe-setup.service -p ActiveState --value)" = failed ]; then
   echo ---
-  journalctl -b -u exe-setup.service -o cat --no-pager -n 50 2>&1
+  journalctl -b _SYSTEMD_UNIT=exe-setup.service _TRANSPORT=stdout -o cat --no-pager -n 50 2>&1
 fi"""
 
 
@@ -579,6 +582,24 @@ def creates(method: Callable[_P, Coroutine[Any, Any, _CM]]) -> Callable[_P, Crea
 # reading the command: a retry cannot run anything twice.
 
 
+_T = TypeVar("_T")
+
+
+def in_thread(future: Future[_T], fn: Callable[[], _T]) -> None:
+    """Call fn in a thread of its own, which a KeyboardInterrupt does not
+    stop, and resolve future with it; unless future is cancelled first."""
+
+    def run() -> None:
+        if not future.set_running_or_notify_cancel():
+            return
+        try:
+            future.set_result(fn())
+        except BaseException as err:  # noqa: BLE001 -- the caller gets it
+            future.set_exception(err)
+
+    threading.Thread(target=run, daemon=True).start()
+
+
 def retry_delay(response: httpx.Response, attempt: int) -> float:
     """Seconds to wait before retrying a 429: Retry-After, or exponential backoff with jitter."""
     try:
@@ -614,20 +635,25 @@ def fits(vm: str, command: str) -> bool:
 #
 # The VM kills the process it started for the session: this script, or a
 # login shell that runs it. The watchdog notices either, as this script
-# ending or its parent changing.
+# ending or its parent changing. It checks four times a second, with shell
+# builtins, so that its one process per check is sleep.
 RUN_SCRIPT = """\
 s=${SHELL:-/bin/sh}
 command -v setsid >/dev/null 2>&1 || exec "$s" -lc "$1"
 setsid "$s" -lc "$1" &
 p=$!
-parent() { st=$(cat /proc/$$/stat 2>/dev/null) && st=${st##*) } && set -- $st && echo $2; }
-pp=$(parent)
-(while [ "$(parent)" = "$pp" ]; do sleep 1; done; kill -KILL -$p) >/dev/null 2>&1 &
+parent() { read -r st </proc/$$/stat && st=${st##*) } && set -- $st && pp=$2; }
+parent 2>/dev/null; p0=$pp
+(while parent && [ "$pp" = "$p0" ]; do sleep 0.25 || sleep 1; done; kill -KILL -$p) >/dev/null 2>&1 &
 w=$!
 wait $p
 c=$?
 kill $w 2>/dev/null
 exit $c"""
+
+# Flushes the VM's recent writes to its disk. Only its disk: a plain sync
+# also waits on network and FUSE mounts, which can hang.
+FLUSH_SCRIPT = "sync -f / 2>/dev/null || sync"
 
 # A command line too long for one request is uploaded first, then run as
 # this: the script reads and deletes the file, then runs what it read.
@@ -762,20 +788,28 @@ def process_name(name: object) -> str:
 
 _PROCESSES = """\
 base=${XDG_STATE_HOME:-$HOME/.local/state}/exedev/processes
+# Sets n to the number in file $1, or to "" if it is missing, empty, or
+# garbled, as a VM that stopped before writing it out can leave it.
+num() { { n=$(cat "$1"); } 2>/dev/null; case $n in ''|*[!0-9]*) n=;; esac; }
 # Prints the process in directory $1 as "PID running", "PID exited STATUS",
-# or "PID lost"; fails if there is none.
+# or "PID lost", where PID is 0 if unknown; fails if there is none, or it is
+# still starting.
 state() {
-  p=$(cat "$1/pid" 2>/dev/null) || return
-  if [ -f "$1/exit" ]; then echo "$p exited $(cat "$1/exit")"; return; fi
-  if [ "$(cat "$1/boot" 2>/dev/null)" = "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)" ] &&
-    kill -0 "$(cat "$1/monitor" 2>/dev/null)" 2>/dev/null; then echo "$p running"; return; fi
-  if [ -f "$1/exit" ]; then echo "$p exited $(cat "$1/exit")"; return; fi
+  [ -d "$1" ] || return
+  num "$1/pid"; p=${n:-0}
+  num "$1/exit"; if [ -n "$n" ]; then echo "$p exited $n"; return; fi
+  if [ "$(cat "$1/boot" 2>/dev/null)" = "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)" ]; then
+    [ "$p" != 0 ] || return
+    if kill -0 "$(cat "$1/monitor" 2>/dev/null)" 2>/dev/null; then echo "$p running"; return; fi
+    num "$1/exit"; if [ -n "$n" ]; then echo "$p exited $n"; return; fi
+  fi
   echo "$p lost"
 }
 """
 
 # $1 name, $2 command line. Prints the pid; exits 3 if the name is taken
-# by a running process.
+# by a running process. Records are synced to disk as they are completed,
+# so that a VM that stops without flushing its disk still has them.
 SPAWN_SCRIPT = (
     _PROCESSES
     + """\
@@ -788,9 +822,10 @@ setsid sh -c 'echo $$ > "$1/monitor"
 setsid "${SHELL:-/bin/sh}" -lc "$2" < /dev/null > "$1/stdout" 2> "$1/stderr" &
 echo $! > "$1/pid.new" && mv "$1/pid.new" "$1/pid"
 wait $!
-echo $? > "$1/exit.new" && mv "$1/exit.new" "$1/exit"' sh "$d" "$2" < /dev/null > /dev/null 2>&1 &
+echo $? > "$1/exit.new" && mv "$1/exit.new" "$1/exit" && sync "$1/exit" "$1"' sh "$d" "$2" < /dev/null > /dev/null 2>&1 &
 i=0
 while [ ! -f "$d/pid" ] && [ $i -lt 100 ]; do sleep 0.05; i=$((i+1)); done
+sync "$d/pid" "$d/boot" "$d/command" "$d/monitor" "$d" 2>/dev/null
 cat "$d/pid\""""
 )
 

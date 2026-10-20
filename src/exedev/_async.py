@@ -48,6 +48,7 @@ from ._errors import (
 from ._wire import (
     DEFAULT_BASE_URL,
     DOWNLOAD_SCRIPT,
+    FLUSH_SCRIPT,
     HEADERS,
     IS_DIRECTORY,
     KILL_SCRIPT,
@@ -145,6 +146,23 @@ class _AsyncTransport:
             await response.aclose()
             await asyncio.sleep(retry_delay(response, attempt))
             attempt += 1
+
+    async def create(self, path: Literal["new", "cp"], args: Sequence[Arg], flags: Sequence[Flag]) -> VMInfo:
+        """Run new or cp: the VM it created. Interrupted (by cancellation, or
+        KeyboardInterrupt) before the response, it waits for the response
+        anyway, deletes the VM, and re-raises: no one else would know of it.
+        Interrupted again, it gives up."""
+        request = asyncio.ensure_future(self.call(path, args, flags, json=True))
+        try:
+            result = await asyncio.shield(request)
+        except Exception:
+            raise
+        except BaseException:
+            with contextlib.suppress(Exception):
+                info = vm_info(await request, path)
+                await self.documents("rm", [info.name])
+            raise
+        return vm_info(result, path)
 
     async def documents(
         self, path: str, args: Sequence[Arg] = (), flags: Sequence[Flag] = ()
@@ -303,7 +321,7 @@ class AsyncVM:
 
     @property
     def created_at(self) -> datetime | None:
-        """When the VM was created; None until listed (see refresh())."""
+        """When the VM was created; None if the server did not say (see refresh())."""
         return self._info.created_at
 
     @property
@@ -678,7 +696,7 @@ class AsyncVM:
     async def _flush(self) -> None:
         """Flush the VM's recent writes to its disk, if it is running. Best effort."""
         with contextlib.suppress(ExeError):
-            await self._t.ssh(self.name, "sync", capture=False, timeout=60)
+            await self._t.ssh(self.name, sh(FLUSH_SCRIPT), capture=False, timeout=60)
 
     async def delete(self) -> None:
         """Delete the VM. A VM that does not exist raises NotFoundError.
@@ -692,7 +710,13 @@ class AsyncVM:
         if summary["failed"] or len(summary["deleted"]) != 1:
             raise api_error("rm", 404 if summary.get("not_found") else 422, body)
 
-    async def restart(self, *, wait_until: WaitUntil = "ssh", timeout: float | None = None) -> t.RestartResponse:
+    async def restart(
+        self,
+        *,
+        flush: bool = True,
+        wait_until: WaitUntil = "ssh",
+        timeout: float | None = None,
+    ) -> t.RestartResponse:
         """Restart a VM.
 
         CLI: ``restart <vmname>``
@@ -700,6 +724,9 @@ class AsyncVM:
         Tag-scoped API keys may run this command.
 
         Args:
+            flush: first flush the VM's recent writes to its disk (best effort: it needs
+                ssh permission, and a running VM), so that it still has them after the
+                restart.
             wait_until: "ssh" (the default) returns once the VM runs commands; "setup"
                 also waits for its setup script to finish, and succeed; "created"
                 returns at once. Waiting needs ssh permission, and raises VMReadyError
@@ -707,17 +734,26 @@ class AsyncVM:
             timeout: seconds to wait for readiness; by default 60, or 600 for "setup".
         """
         check_ready(wait_until, timeout)
+        if flush:
+            await self._flush()
         result: t.RestartResponse = await self._t.call("restart", [self.name], json=True)
         await self._ready(wait_until, timeout)
         return result
 
-    async def pause(self) -> t.PauseResponse:
+    async def pause(self, *, flush: bool = True) -> t.PauseResponse:
         """Pause a VM (snapshot RAM to disk, free its CPU and memory).
 
         CLI: ``pause <vmname>``
 
         Tag-scoped API keys may run this command.
+
+        Args:
+            flush: first flush the VM's recent writes to its disk (best effort: it needs
+                ssh permission, and a running VM), so that copies of the paused VM have
+                them.
         """
+        if flush:
+            await self._flush()
         result: t.PauseResponse = await self._t.call("pause", [self.name], json=True)
         self._absorb(result)
         return result
@@ -812,8 +848,8 @@ class AsyncVM:
             pool: create the copy in one of your team's pools (see ``exe.pool.list()``)
             standalone: create the copy as a standalone VM with its own reserved
                 capacity (requires a plan with standalone VMs and team approval)
-            flush: first flush the VM's recent writes to its disk, so that the copy has
-                them. Best effort: it needs ssh permission, and a running VM.
+            flush: first flush the VM's recent writes to its disk (best effort: it needs
+                ssh permission, and a running VM), so that the copy has them.
             wait_until: "ssh" (the default) returns once the VM runs commands; "setup"
                 also waits for its setup script to finish, and succeed; "created"
                 returns at once. Waiting needs ssh permission, and raises VMReadyError
@@ -826,7 +862,7 @@ class AsyncVM:
         check_ready(wait_until, timeout)
         if flush:
             await self._flush()
-        result = await self._t.call(
+        result = await self._t.create(
             "cp",
             [self.name, name],
             [
@@ -837,9 +873,8 @@ class AsyncVM:
                 ("pool", "string", pool),
                 ("standalone", "bool", standalone or None),
             ],
-            json=True,
         )
-        vm = AsyncVM(self._t, vm_info(result, "cp"), owned=True)
+        vm = AsyncVM(self._t, result, owned=True)
         return await vm._created(wait_until, timeout, keep_on_failure)
 
     async def resize(
@@ -940,7 +975,8 @@ class AsyncProcess:
 
     @property
     def pid(self) -> int:
-        """Its process ID on the VM, which is also its process group's."""
+        """Its process ID on the VM, which is also its process group's; 0 if
+        that is unknown, as it can be for a lost process."""
         return self._state.pid
 
     @property
@@ -1185,7 +1221,7 @@ class AsyncClient:
                 is interrupted.
         """
         check_ready(wait_until, timeout)
-        result = await self._t.call(
+        result = await self._t.create(
             "new",
             [],
             [
@@ -1206,9 +1242,8 @@ class AsyncClient:
                 ("tag", "repeated", tags),
                 ("no-email", "bool", None if email else True),
             ],
-            json=True,
         )
-        vm = AsyncVM(self._t, vm_info(result, "new"), owned=True)
+        vm = AsyncVM(self._t, result, owned=True)
         return await vm._created(wait_until, timeout, keep_on_failure)
 
     async def whoami(self) -> t.WhoamiResponse:

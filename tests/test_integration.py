@@ -13,9 +13,12 @@ import asyncio
 import json
 import os
 import random
+import signal
+import threading
 import time
 from pathlib import Path
 
+import httpx
 import pytest
 
 import exedev
@@ -41,7 +44,14 @@ def token() -> str | None:
 
 
 NAME = f"sdk-py-{int(time.time() * 1000):x}"
-NAMES = {"vm": NAME, "renamed": f"{NAME}-r", "copy": f"{NAME}-c", "setup": f"{NAME}-s", "missing": f"{NAME}-x"}
+NAMES = {
+    "vm": NAME,
+    "renamed": f"{NAME}-r",
+    "copy": f"{NAME}-c",
+    "setup": f"{NAME}-s",
+    "missing": f"{NAME}-x",
+    "interrupted": f"{NAME}-i",
+}
 
 
 @pytest.fixture(scope="module")
@@ -76,6 +86,7 @@ def test_new(vm):
     assert vm.name == NAME
     assert TAG in vm.tags
     assert vm.https_url and vm.https_url.startswith("https://")
+    assert vm.created_at is not None
 
 
 @skip_ssh
@@ -219,13 +230,25 @@ def test_vms_and_refresh(exe, vm):
 
 
 def test_copy(vm):
-    with vm.copy(NAMES["copy"], **READY) as copy:
-        assert copy.name == NAMES["copy"]
-        assert TAG in copy.tags
-        if SSH:
-            assert copy.run("hostname", check=True).stdout.strip() == NAMES["copy"]
-    with pytest.raises(exedev.NotFoundError):
-        copy.refresh()
+    # A copy of a paused VM has its recent writes: pause() flushes them.
+    if SSH:
+        vm.write_file("recent.txt", "before pause\n")
+    vm.pause()
+    try:
+        with vm.copy(NAMES["copy"], **READY) as copy:
+            assert copy.name == NAMES["copy"]
+            assert TAG in copy.tags
+            assert copy.comment == "sdk integration test"
+            assert copy.created_at is not None
+            if SSH:
+                assert copy.run("hostname; cat recent.txt", check=True).stdout.split("\n")[:2] == [
+                    NAMES["copy"],
+                    "before pause",
+                ]
+        with pytest.raises(exedev.NotFoundError):
+            copy.refresh()
+    finally:
+        vm.resume(**READY)
 
 
 def test_stats_and_share(vm):
@@ -241,9 +264,14 @@ def test_account(exe):
 
 
 def test_restart(vm):
+    if SSH:
+        vm.write_file("recent.txt", "before restart\n")
+        sleeper = vm.spawn("sleep 600", name="sleeper")
     vm.restart(**READY)
     if SSH:
-        assert vm.run("true").ok
+        assert vm.read_file("recent.txt") == b"before restart\n"
+        with pytest.raises(exedev.ProcessLostError):
+            sleeper.wait(timeout=30)
 
 
 def test_rename(exe, vm):
@@ -260,16 +288,32 @@ def test_rename(exe, vm):
 
 @skip_ssh
 def test_setup_failure(exe):
-    script = "#!/bin/sh\necho setup-output-marker\necho 'back\\slash'\nexit 3"
+    script = "#!/bin/sh\nsudo true\necho setup-output-marker\necho 'back\\slash' >&2\nexit 3"
     with pytest.raises(exedev.VMSetupError) as info:
         exe.new(name=NAMES["setup"], setup_script=script, wait_until="setup")
     assert info.value.vm.name == NAMES["setup"]
     assert info.value.exit_code == 3
-    assert "setup-output-marker" in info.value.output
-    assert "back\\slash" in info.value.output
+    # The script's output, and only its output: not systemd's or sudo's.
+    assert info.value.output.splitlines() == ["setup-output-marker", "back\\slash"]
     # new() deleted the VM it could not hand over.
     with pytest.raises(exedev.NotFoundError):
         exe.vm(NAMES["setup"])
+
+
+def test_interrupted_new(exe):
+    """Interrupted while the server creates it, new() still deletes the VM."""
+    main = threading.main_thread().ident
+    assert main is not None
+
+    def interrupt(request: httpx.Request) -> None:
+        if request.content.startswith(b"new "):
+            threading.Timer(0.3, signal.pthread_kill, (main, signal.SIGINT)).start()
+
+    http = httpx.Client(timeout=300, event_hooks={"request": [interrupt]})
+    with exedev.Client(token(), base_url=BASE_URL, http_client=http) as client, pytest.raises(KeyboardInterrupt):
+        client.new(name=NAMES["interrupted"], **READY)
+    with pytest.raises(exedev.NotFoundError):
+        exe.vm(NAMES["interrupted"])
 
 
 def test_delete(exe, vm):

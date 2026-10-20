@@ -145,6 +145,8 @@ class NewResponse(TypedDict):
     xterm_url: NotRequired[str]
     comment: NotRequired[str]
     """The ``comment`` the VM was created with; absent when there is none."""
+    created_at: str
+    """When the VM was created, as in `ls`."""
     pool_id: NotRequired[str]
     standalone: NotRequired[bool]
     error: NotRequired[str]
@@ -167,6 +169,10 @@ class CpResponse(TypedDict):
     https_url: str
     tags: list[str]
     """The copy's tags: the source's, unless ``copy_tags=False``."""
+    comment: NotRequired[str]
+    """The copy's comment, which is the source's; absent when there is none."""
+    created_at: NotRequired[str]
+    """When the copy was created, as in `ls`; absent if that is unknown."""
     elapsed: float
     """How long the copy took, in seconds."""
     pool_id: NotRequired[str]

@@ -147,7 +147,9 @@ seconds (60, or 600 for setup), `VMReadyError` is raised.
 
 If waiting fails, or is interrupted by an exception, a `KeyboardInterrupt`,
 or cancellation, `new()` deletes the VM before raising. Pass
-`keep_on_failure=True` to keep it for debugging, as `err.vm`.
+`keep_on_failure=True` to keep it for debugging, as `err.vm`. Interrupted
+while the server is still creating the VM, `new()` (and `vm.copy()`) waits
+for it, deletes it, and then raises; a second interrupt gives up on it.
 
 A VM from `new()` or `vm.copy()` is a context manager that deletes it at the
 end of the block (`async with exe.new() as vm:` in async code). Otherwise,
@@ -161,9 +163,9 @@ for vm in exe.vms():                  # or exe.vms("web-*")
 
 vm = exe.vm("build")                  # NotFoundError if there is none
 
-copy = vm.copy("build-2", cpu=8)      # a new VM with a copy of the disk (syncs it first)
+copy = vm.copy("build-2", cpu=8)      # a new VM with a copy of the disk
 vm.restart()                          # waits for SSH again, like new()
-vm.pause(); vm.resume()
+vm.pause(); vm.resume()               # a paused VM can be copied too
 vm.rename("builder")                  # vm.name, ssh_dest, and https_url follow
 vm.tag("ci", "linux"); vm.untag("linux")
 vm.set_comment("nightly builds")
@@ -178,6 +180,11 @@ exe.delete("a", "b", vm)              # several at once; reports, rather than ra
 A VM's attributes (`status`, `ssh_dest`, `https_url`, `tags`, `comment`,
 `region`, `created_at`) are a snapshot: the SDK's own operations keep them
 current, and `refresh()` fetches the rest.
+
+`copy()`, `pause()`, and `restart()` (and `resize(restart=True)`) first flush
+the VM's recent writes to its disk, so that copies and the restarted VM have
+them. Pass `flush=False` to skip that. It is best effort: it needs a token that
+may run `ssh`.
 
 `vm.delete()` raises `NotFoundError` for a VM that is gone, while
 `exe.delete()` reports each VM's fate in its result, since some may be
