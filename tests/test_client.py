@@ -56,6 +56,7 @@ def test_flags(api):
     api(exe.billing.receipts(from_="2026-01", to=None))
     api(exe.billing.capacity(cpu=8))
     api(exe.ssh_key.add("ssh-ed25519 AAAA me@host", tag="ci"))
+    api(exe.ssh_key.generate_api_key(label="ci", tag="ci", exp="30d"))
     api(exe.integrations.add("http-proxy", name="api", target="https://example.com", headers=["A:1", "B: 2"]))
     api(exe.integrations.setup.github(delete=False, list=True))
     assert server.commands == [
@@ -63,6 +64,7 @@ def test_flags(api):
         "billing receipts --from=2026-01",
         "billing capacity --cpu=8",
         "ssh-key add --tag=ci 'ssh-ed25519 AAAA me@host'",
+        "ssh-key generate-api-key --exp=30d --label=ci --tag=ci",
         "integrations add --header=A:1 --header='B: 2' --name=api --target=https://example.com http-proxy",
         "integrations setup github --list",
     ]

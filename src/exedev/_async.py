@@ -826,6 +826,7 @@ class AsyncVM:
         copy_tags: bool = True,
         cpu: int | None = None,
         disk: int | str | None = None,
+        egress: str | None = None,
         memory: int | str | None = None,
         pool: str | None = None,
         standalone: bool = False,
@@ -844,6 +845,7 @@ class AsyncVM:
             copy_tags: copy tags from source VM (use ``copy_tags=False`` to disable)
             cpu: number of CPUs
             disk: disk size (e.g., 20, 20GB, 50G)
+            egress: egress policy: integrations or all (default source policy)
             memory: memory allocation (e.g., 4, 4GB, 8G)
             pool: create the copy in one of your team's pools (see ``exe.pool.list()``)
             standalone: create the copy as a standalone VM with its own reserved
@@ -869,6 +871,7 @@ class AsyncVM:
                 ("copy-tags", "bool", None if copy_tags else False),
                 ("cpu", "number", cpu),
                 ("disk", "string", disk),
+                ("egress", "string", egress),
                 ("memory", "string", memory),
                 ("pool", "string", pool),
                 ("standalone", "bool", standalone or None),
@@ -1167,6 +1170,7 @@ class AsyncClient:
         comment: str | None = None,
         cpu: int | None = None,
         disk: int | str | None = None,
+        egress: str | None = None,
         env: Mapping[str, str] | None = None,
         image: str | None = None,
         integrations: Sequence[str] | None = None,
@@ -1192,6 +1196,7 @@ class AsyncClient:
             comment: short note about the VM (max 200 bytes)
             cpu: number of CPUs (default 2; run 'billing plan' for plan limits)
             disk: disk size (e.g., 20, 20GB, 50G)
+            egress: egress policy: integrations or all (default all)
             env: environment variable in KEY=VALUE format (can be specified multiple
                 times)
             image: container image (server default: exeuntu)
@@ -1228,6 +1233,7 @@ class AsyncClient:
                 ("comment", "string", comment),
                 ("cpu", "number", cpu),
                 ("disk", "string", disk),
+                ("egress", "string", egress),
                 ("env", "repeated", env_flags(env)),
                 ("image", "string", image),
                 ("integration", "repeated", integrations),
@@ -1245,6 +1251,15 @@ class AsyncClient:
         )
         vm = AsyncVM(self._t, result, owned=True)
         return await vm._created(wait_until, timeout, keep_on_failure)
+
+    async def egress(self, vmname: str, value: Literal["integrations", "all"] | None = None) -> Any:
+        """Show or set a VM's egress policy.
+
+        CLI: ``egress <vmname> [integrations|all]``
+
+        Tag-scoped API keys may run this command.
+        """
+        return await self._t.call("egress", [vmname, value])
 
     async def whoami(self) -> t.WhoamiResponse:
         """Show user information (email, keys, etc).
@@ -1306,17 +1321,35 @@ class _AsyncSshKey:
         """
         return await self._t.call("ssh-key list", [])
 
-    async def add(self, public_key: str, *, tag: str | None = None) -> Any:
+    async def add(
+        self,
+        public_key: str,
+        *,
+        ssh_user: str | None = None,
+        tag: str | None = None,
+        vm: str | None = None,
+    ) -> Any:
         """Add a new SSH key to your account.
 
-        CLI: ``ssh-key add [--tag=TAG] <public-key>``
+        CLI: ``ssh-key add [--tag=TAG | --vm=VM [--ssh-user=USER]] <public-key>``
 
         Tag-scoped API keys may run this command.
 
         Args:
+            ssh_user: with ``vm``, the Unix user to log in to the VM as (default: the
+                VM's default user)
             tag: scope key to VMs with this tag
+            vm: scope key to a VM
         """
-        return await self._t.call("ssh-key add", [public_key], [("tag", "string", tag)])
+        return await self._t.call(
+            "ssh-key add",
+            [public_key],
+            [
+                ("ssh-user", "string", ssh_user),
+                ("tag", "string", tag),
+                ("vm", "string", vm),
+            ],
+        )
 
     async def remove(self, key: str) -> Any:
         """Remove an SSH key from your account.
@@ -1342,11 +1375,12 @@ class _AsyncSshKey:
         cmds: str | None = None,
         exp: str | None = None,
         label: str | None = None,
+        tag: str | None = None,
         vm: str | None = None,
     ) -> Any:
         """Generate an API key for the exe.dev HTTPS API or for a specific VM.
 
-        CLI: ``ssh-key generate-api-key [--label=NAME] [--vm=VMNAME] [--cmds=CMD1,CMD2] [--exp=30d]``
+        CLI: ``ssh-key generate-api-key [--label=NAME] [--vm=VMNAME | --tag=TAG] [--cmds=CMD1,CMD2] [--exp=30d]``
 
         Tag-scoped API keys may run this command.
 
@@ -1354,6 +1388,7 @@ class _AsyncSshKey:
             cmds: comma-separated list of allowed commands (empty = defaults)
             exp: expiry duration (e.g. 30d, 1y) or 'never'
             label: label for this token's SSH key
+            tag: scope key to VMs with this tag
             vm: scope key to a VM (authenticates to its HTTPS endpoints instead of
                 exe.dev commands)
         """
@@ -1364,6 +1399,7 @@ class _AsyncSshKey:
                 ("cmds", "string", cmds),
                 ("exp", "string", exp),
                 ("label", "string", label),
+                ("tag", "string", tag),
                 ("vm", "string", vm),
             ],
         )
@@ -1376,17 +1412,25 @@ class _AsyncIntegrations:
         self._t = t
         self.setup = _AsyncIntegrationsSetup(self._t)
 
-    async def list(self, *, usage: bool = False) -> Any:
+    async def list(self, *, available: bool = False, usage: bool = False) -> Any:
         """List your integrations.
 
-        CLI: ``integrations list [--json [--usage]]``
+        CLI: ``integrations list [--json [--usage]] | integrations list --available [--json]``
 
         Tag-scoped API keys may run this command.
 
         Args:
+            available: list available integrations
             usage: include per-VM usage (lastUsedAt, usedByVMs); JSON only
         """
-        return await self._t.call("integrations list", [], [("usage", "bool", usage or None)])
+        return await self._t.call(
+            "integrations list",
+            [],
+            [
+                ("available", "bool", available or None),
+                ("usage", "bool", usage or None),
+            ],
+        )
 
     async def add(
         self,

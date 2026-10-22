@@ -23,7 +23,9 @@ with exe.new(image="ubuntu:24.04") as vm:  # deleted at the end of the block
 `new()` returns once the VM runs commands, so the first `run()` needs no
 retry loop, and if it fails or is interrupted on the way, it deletes the VM
 rather than leak it. Create a token with `ssh exe.dev ssh-key generate-api-key`; its
-permissions decide which methods work.
+permissions decide which methods work. For automation, prefer a key scoped to
+a tag (`--tag=ci`): it manages only the VMs with that tag, and VMs it creates
+get the tag.
 
 The same API is available for asyncio:
 
@@ -210,7 +212,7 @@ arguments (`--copy-tags=false` is `copy_tags=False`).
 ```python
 exe.whoami()
 exe.ssh_key.list()
-exe.ssh_key.generate_api_key(label="ci", vm="build", exp="30d")
+exe.ssh_key.generate_api_key(label="ci", tag="ci", exp="30d")["token"]
 exe.integrations.add("http-proxy", name="api", target="https://api.example.com", headers=["X-Key:secret"])
 exe.integrations.attach("api", "tag:ci")
 exe.team()                            # a group that is also a command is callable
