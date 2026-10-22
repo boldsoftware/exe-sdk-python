@@ -38,7 +38,7 @@ from ._errors import (
     ProtocolError,
     is_error_document,
 )
-from .types import RmResponse
+from .types import EgressPolicy, RmResponse
 
 DEFAULT_BASE_URL = "https://exe.dev"
 
@@ -62,7 +62,8 @@ MAX_LINE = 64 * 1024
 MAX_FRAME = 1024 * 1024
 
 Flag = tuple[str, str, Any]
-"""A command-line flag: name, kind (bool, number, string, or repeated), and value. None omits it."""
+"""A command-line flag: name, kind (bool, number, string, repeated, or list), and value. None omits it.
+A repeated flag is given once per value; a list, once, comma-separated."""
 Arg = str | int | Sequence[str] | None
 """A positional argument, or several (variadic), or None for an omitted optional one."""
 
@@ -77,6 +78,8 @@ def command_line(path: str, args: Sequence[Arg], flags: Iterable[Flag] = ()) -> 
             words.append(f"--{name}" if value else f"--{name}=false")
         elif kind == "repeated":
             words.extend(f"--{name}={shlex.quote(v)}" for v in _strings(name, value))
+        elif kind == "list":
+            words.append(f"--{name}={shlex.quote(_list(name, value))}")
         else:
             words.append(f"--{name}={shlex.quote(_word(name, value))}")
     positionals: list[str] = []
@@ -110,6 +113,20 @@ def _strings(name: str, value: object) -> list[str]:
     if isinstance(value, Iterable):
         return [_word(name, v) for v in cast(Iterable[object], value)]
     raise TypeError(f"{name}: expected strings, not {type(value).__name__}")
+
+
+def _list(name: str, value: object) -> str:
+    """A list flag's value, comma-separated. A string is passed as it is."""
+    if isinstance(value, str):
+        return value
+    values = _strings(name, value)
+    if not values:
+        # The server would take it for the default, which may be more.
+        raise ValueError(f"{name}: an empty list; omit it for the default")
+    for v in values:
+        if not v or "," in v:
+            raise ValueError(f"{name}: {v!r} is empty or has a comma")
+    return ",".join(values)
 
 
 def required(name: str, values: Sequence[str]) -> Sequence[str]:
@@ -353,6 +370,7 @@ class VMInfo:
     region: str | None = None
     comment: str = ""
     created_at: datetime | None = None
+    egress: EgressPolicy | None = None
     prompt_error: str | None = None
 
 
@@ -392,8 +410,18 @@ def vm_info(value: object, operation: Literal["new", "ls", "cp"]) -> VMInfo:
         region=string("region"),
         comment=string("comment") or "",
         created_at=created_at,
+        egress=egress_policy(obj.get("egress_policy")),
         prompt_error=string("error"),
     )
+
+
+def egress_policy(value: object) -> EgressPolicy | None:
+    """value, if it is an egress policy this SDK knows."""
+    if value == "integrations":
+        return "integrations"
+    if value == "all":
+        return "all"
+    return None
 
 
 def vm_list(value: object) -> list[VMInfo]:

@@ -19,6 +19,9 @@ __all__ = [
     "DomainAddResponse",
     "DomainAdded",
     "DomainRmResponse",
+    "EgressPolicy",
+    "EgressResponse",
+    "GenerateAPIKeyResponse",
     "NewResponse",
     "PauseResponse",
     "ReceiveEmailChange",
@@ -59,6 +62,10 @@ __all__ = [
 ]
 
 
+EgressPolicy: TypeAlias = Literal["integrations", "all"]
+"""What a VM may reach: "all" of the internet, or only exe.dev's "integrations"."""
+
+
 class VMRecord(TypedDict):
     """A VM as returned by `ls --json`."""
 
@@ -74,6 +81,8 @@ class VMRecord(TypedDict):
     """The VM's comment, if it has one."""
     created_at: NotRequired[str]
     """When the VM was created, in RFC 3339 format."""
+    egress_policy: NotRequired[EgressPolicy]
+    """Absent from VMs you do not own."""
 
 
 class VMListResponse(TypedDict):
@@ -147,6 +156,7 @@ class NewResponse(TypedDict):
     """The ``comment`` the VM was created with; absent when there is none."""
     created_at: str
     """When the VM was created, as in `ls`."""
+    egress_policy: EgressPolicy
     pool_id: NotRequired[str]
     standalone: NotRequired[bool]
     error: NotRequired[str]
@@ -173,6 +183,8 @@ class CpResponse(TypedDict):
     """The copy's comment, which is the source's; absent when there is none."""
     created_at: NotRequired[str]
     """When the copy was created, as in `ls`; absent if that is unknown."""
+    egress_policy: EgressPolicy
+    """The source's, unless ``egress`` says otherwise."""
     elapsed: float
     """How long the copy took, in seconds."""
     pool_id: NotRequired[str]
@@ -265,6 +277,27 @@ class ResizeResponse(TypedDict):
     approval_reasons: NotRequired[list[str]]
     """Why approval is needed: "per_vm" (the VM's limit) or "host"."""
     disk_resize_request: NotRequired[DiskResizeRequest]
+
+
+class EgressResponse(TypedDict):
+    """The response to `egress`."""
+
+    vm_name: str
+    egress_policy: EgressPolicy
+
+
+class GenerateAPIKeyResponse(TypedDict):
+    """The response to `ssh-key generate-api-key`."""
+
+    label: str
+    token: str
+    """The API key, for the Authorization header: Bearer <token>."""
+    namespace: str
+    """Where the key works: exe.dev's API, or one VM's HTTPS endpoints."""
+    fingerprint: str
+    """The fingerprint of the key's SSH key, as in `ssh-key list`."""
+    expires_at: NotRequired[str]
+    """When the key expires, in RFC 3339 format; absent if it does not."""
 
 
 class CommentResponse(TypedDict):

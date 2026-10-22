@@ -171,6 +171,7 @@ vm.pause(); vm.resume()               # a paused VM can be copied too
 vm.rename("builder")                  # vm.name, ssh_dest, and https_url follow
 vm.tag("ci", "linux"); vm.untag("linux")
 vm.set_comment("nightly builds")
+vm.set_egress("integrations")         # reach only exe.dev integrations, not the internet
 vm.resize(memory="16G", restart=True) # memory and CPU changes need a restart
 vm.url(3000, "/api")                  # https://build.exe.xyz:3000/api
 vm.stats(range="7d")
@@ -180,8 +181,8 @@ exe.delete("a", "b", vm)              # several at once; reports, rather than ra
 ```
 
 A VM's attributes (`status`, `ssh_dest`, `https_url`, `tags`, `comment`,
-`region`, `created_at`) are a snapshot: the SDK's own operations keep them
-current, and `refresh()` fetches the rest.
+`egress`, `region`, `created_at`) are a snapshot: the SDK's own operations
+keep them current, and `refresh()` fetches the rest.
 
 `copy()`, `pause()`, and `restart()` (and `resize(restart=True)`) first flush
 the VM's recent writes to its disk, so that copies and the restarted VM have
@@ -213,6 +214,7 @@ arguments (`--copy-tags=false` is `copy_tags=False`).
 exe.whoami()
 exe.ssh_key.list()
 exe.ssh_key.generate_api_key(label="ci", tag="ci", exp="30d")["token"]
+exe.ssh_key.generate_api_key(cmds=["ls", "share show"])  # lists are lists, not comma-separated
 exe.integrations.add("http-proxy", name="api", target="https://api.example.com", headers=["X-Key:secret"])
 exe.integrations.attach("api", "tag:ci")
 exe.team()                            # a group that is also a command is callable

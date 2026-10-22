@@ -87,6 +87,7 @@ def test_new(vm):
     assert TAG in vm.tags
     assert vm.https_url and vm.https_url.startswith("https://")
     assert vm.created_at is not None
+    assert vm.egress == "all"
 
 
 @skip_ssh
@@ -229,6 +230,20 @@ def test_vms_and_refresh(exe, vm):
     assert vm.comment == "sdk integration test"
 
 
+def test_egress(exe, vm):
+    try:
+        result = vm.set_egress("integrations")
+    except exedev.PermissionDeniedError:
+        pytest.skip("the token may not run egress")
+    try:
+        assert result["egress_policy"] == "integrations"
+        assert vm.egress == "integrations"
+        assert exe.vm(vm.name).egress == "integrations"
+    finally:
+        vm.set_egress("all")
+    assert vm.egress == "all"
+
+
 def test_copy(vm):
     # A copy of a paused VM has its recent writes: pause() flushes them.
     if SSH:
@@ -240,6 +255,7 @@ def test_copy(vm):
             assert TAG in copy.tags
             assert copy.comment == "sdk integration test"
             assert copy.created_at is not None
+            assert copy.egress == vm.egress
             if SSH:
                 assert copy.run("hostname; cat recent.txt", check=True).stdout.split("\n")[:2] == [
                     NAMES["copy"],

@@ -84,6 +84,7 @@ from ._wire import (
     VMInfo,
     check_ready,
     command_line,
+    egress_policy,
     env_flags,
     file_mode,
     fits,
@@ -324,6 +325,12 @@ class VM:
         return self._info.region
 
     @property
+    def egress(self) -> t.EgressPolicy | None:
+        """What the VM may reach: "all" of the internet, or only exe.dev's
+        "integrations"; None for a VM you do not own. set_egress() sets it."""
+        return self._info.egress
+
+    @property
     def created_at(self) -> datetime | None:
         """When the VM was created; None if the server did not say (see refresh())."""
         return self._info.created_at
@@ -363,13 +370,15 @@ class VM:
             self.delete()
 
     def _absorb(self, result: object) -> None:
-        """Take the status, comment, and tags a command reports for this VM into the snapshot."""
+        """Take the status, comment, tags, and egress policy a command reports for this VM into the snapshot."""
         if not isinstance(result, dict) or result.get("vm_name") != self.name:
             return
         if isinstance(status := result.get("status"), str):
             self._info.status = status
         if isinstance(comment := result.get("comment"), str):
             self._info.comment = comment
+        if (egress := egress_policy(result.get("egress_policy"))) is not None:
+            self._info.egress = egress
         tags = result.get("tags")
         if isinstance(tags, list) and all(isinstance(tag, str) for tag in tags):
             self._info.tags = tuple(tags)
@@ -825,7 +834,7 @@ class VM:
         copy_tags: bool = True,
         cpu: int | None = None,
         disk: int | str | None = None,
-        egress: str | None = None,
+        egress: Literal["integrations", "all"] | None = None,
         memory: int | str | None = None,
         pool: str | None = None,
         standalone: bool = False,
@@ -913,6 +922,17 @@ class VM:
         )
         if restart:
             self.restart()
+        return result
+
+    def set_egress(self, policy: Literal["integrations", "all"]) -> t.EgressResponse:
+        """Set what the VM may reach: all of the internet, or only exe.dev's integrations.
+
+        CLI: ``egress <vmname> [integrations|all]``
+
+        Tag-scoped API keys may run this command.
+        """
+        result: t.EgressResponse = self._t.call("egress", [self.name, policy], json=True)
+        self._absorb(result)
         return result
 
     def set_comment(self, text: str) -> t.CommentResponse:
@@ -1168,7 +1188,7 @@ class Client:
         comment: str | None = None,
         cpu: int | None = None,
         disk: int | str | None = None,
-        egress: str | None = None,
+        egress: Literal["integrations", "all"] | None = None,
         env: Mapping[str, str] | None = None,
         image: str | None = None,
         integrations: Sequence[str] | None = None,
@@ -1249,15 +1269,6 @@ class Client:
         )
         vm = VM(self._t, result, owned=True)
         return vm._created(wait_until, timeout, keep_on_failure)
-
-    def egress(self, vmname: str, value: Literal["integrations", "all"] | None = None) -> Any:
-        """Show or set a VM's egress policy.
-
-        CLI: ``egress <vmname> [integrations|all]``
-
-        Tag-scoped API keys may run this command.
-        """
-        return self._t.call("egress", [vmname, value])
 
     def whoami(self) -> t.WhoamiResponse:
         """Show user information (email, keys, etc).
@@ -1370,12 +1381,12 @@ class _SshKey:
     def generate_api_key(
         self,
         *,
-        cmds: str | None = None,
+        cmds: Sequence[str] | None = None,
         exp: str | None = None,
         label: str | None = None,
         tag: str | None = None,
         vm: str | None = None,
-    ) -> Any:
+    ) -> t.GenerateAPIKeyResponse:
         """Generate an API key for the exe.dev HTTPS API or for a specific VM.
 
         CLI: ``ssh-key generate-api-key [--label=NAME] [--vm=VMNAME | --tag=TAG] [--cmds=CMD1,CMD2] [--exp=30d]``
@@ -1383,24 +1394,27 @@ class _SshKey:
         Tag-scoped API keys may run this command.
 
         Args:
-            cmds: comma-separated list of allowed commands (empty = defaults)
+            cmds: the commands the key may run, such as ["ls", "share show"] (server
+                default: a set that includes ls, new, and whoami)
             exp: expiry duration (e.g. 30d, 1y) or 'never'
             label: label for this token's SSH key
             tag: scope key to VMs with this tag
             vm: scope key to a VM (authenticates to its HTTPS endpoints instead of
                 exe.dev commands)
         """
-        return self._t.call(
+        result: t.GenerateAPIKeyResponse = self._t.call(
             "ssh-key generate-api-key",
             [],
             [
-                ("cmds", "string", cmds),
+                ("cmds", "list", cmds),
                 ("exp", "string", exp),
                 ("label", "string", label),
                 ("tag", "string", tag),
                 ("vm", "string", vm),
             ],
+            json=True,
         )
+        return result
 
 
 class _Integrations:
@@ -1439,7 +1453,7 @@ class _Integrations:
         bearer: str | None = None,
         comment: str | None = None,
         default: bool = False,
-        fields: str | None = None,
+        fields: Sequence[str] | None = None,
         for_: str | None = None,
         headers: Sequence[str] | None = None,
         host_keys: Sequence[str] | None = None,
@@ -1469,9 +1483,9 @@ class _Integrations:
             default: install the canonical reflection integration with all fields;
                 attaches to auto:all unless ``attach=["vm:<name>"]`` is supplied; no
                 other customization
-            fields: comma-separated reflection fields to expose (email, integrations,
-                tags, comment, default_port); 'all' exposes every field including ones
-                added in the future; 'none' disables every field (server default: all)
+            fields: reflection fields to expose (email, integrations, tags, comment,
+                default_port); 'all' exposes every field including ones added in the
+                future; 'none' disables every field (server default: all)
             for_: time-box every ``attach`` to a duration from now (e.g. 2h, 45m);
                 access lapses automatically
             headers: header to inject (e.g. X-Auth:secret)
@@ -1499,7 +1513,7 @@ class _Integrations:
                 ("bearer", "string", bearer),
                 ("comment", "string", comment),
                 ("default", "bool", default or None),
-                ("fields", "string", fields),
+                ("fields", "list", fields),
                 ("for", "string", for_),
                 ("header", "repeated", headers),
                 ("host-key", "repeated", host_keys),
@@ -1542,7 +1556,7 @@ class _Integrations:
         bearer: str | None = None,
         clear_header: bool = False,
         comment: str | None = None,
-        fields: str | None = None,
+        fields: Sequence[str] | None = None,
         headers: Sequence[str] | None = None,
         host_keys: Sequence[str] | None = None,
         no_auth: bool = False,
@@ -1566,9 +1580,9 @@ class _Integrations:
                 TOKEN"]``; combines with ``headers``)
             clear_header: remove injected headers for http-proxy
             comment: free-form comment stored with the integration
-            fields: comma-separated reflection fields to expose (email, integrations,
-                tags, comment, default_port); 'all' exposes every field including ones
-                added in the future; 'none' disables every field
+            fields: reflection fields to expose (email, integrations, tags, comment,
+                default_port); 'all' exposes every field including ones added in the
+                future; 'none' disables every field
             headers: header to inject for http-proxy; replaces all existing headers
             host_keys: replacement host keys for ssh-key; replaces the whole list; one -
                 reads them piped in
@@ -1589,7 +1603,7 @@ class _Integrations:
                 ("bearer", "string", bearer),
                 ("clear-header", "bool", clear_header or None),
                 ("comment", "string", comment),
-                ("fields", "string", fields),
+                ("fields", "list", fields),
                 ("header", "repeated", headers),
                 ("host-key", "repeated", host_keys),
                 ("no-auth", "bool", no_auth or None),
@@ -2027,8 +2041,8 @@ class _TeamSettingsVmPlacement:
 
         Args:
             cpus: CPUs to reserve for each member pool (required)
-            max_vms: maximum VMs in each member pool (Work defaults to 25 per vCPU, up
-                to 1000) (server default: 100)
+            max_vms: maximum VMs in each member pool (default 1000) (server default:
+                1000)
         """
         return self._t.call(
             "team settings vm-placement member-pool",
@@ -2095,8 +2109,7 @@ class _Pool:
         Args:
             cpus: number of CPUs reserved for the pool (required; an even number of
                 vCPUs from 2 through 512 (2, 4, 6, and so on; memory is 2 GiB per vCPU))
-            max_vms: maximum VMs in the pool (Work defaults to the size limit of up to
-                25 VMs per vCPU, capped at 1000 VMs) (server default: 100)
+            max_vms: maximum VMs in the pool (default 1000) (server default: 1000)
             region: region code for the pool (required unless your team has dedicated
                 hosts, which decide the region)
         """
@@ -2176,7 +2189,7 @@ class _Pool:
                 2 up to the placement limit)
             force: allow ``max_vms`` below the current VM count (does not stop or evict
                 VMs)
-            max_vms: maximum VMs in the pool (Work: at most 25 per vCPU, up to 1000)
+            max_vms: maximum VMs in the pool (up to 1000)
         """
         return self._t.call(
             "pool resize",

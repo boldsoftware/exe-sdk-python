@@ -24,6 +24,7 @@ NEW = {
     "ssh_port": 22,
     "https_url": "https://worker.exe.xyz",
     "proxy_port": 8000,
+    "egress_policy": "integrations",
 }
 CP = {
     "name": "copy",
@@ -33,6 +34,7 @@ CP = {
     "ssh_host": "copy.exe.xyz",
     "https_url": "https://copy.exe.xyz",
     "tags": ["ci"],
+    "egress_policy": "all",
     "elapsed": 1.5,
 }
 NOT_READY = error(422, "failed to connect to VM: connection refused")
@@ -72,14 +74,16 @@ def test_new_flags(api):
             disk=20,
             env={"A": "1", "B": "two words"},
             setup_script="apt-get install -y jq",
+            egress="integrations",
             wait_until="created",
         )
     )
-    api(exe.new(email=True, wait_until="created"))
+    vm = api(exe.new(email=True, wait_until="created"))
+    assert vm.egress == "integrations"
     assert server.commands == [
         (
-            "new --cpu=2 --disk=20 --env=A=1 --env='B=two words' --image=ubuntu:24.04 --memory=4G "
-            "--setup-script='apt-get install -y jq' --no-email"
+            "new --cpu=2 --disk=20 --egress=integrations --env=A=1 --env='B=two words' --image=ubuntu:24.04 "
+            "--memory=4G --setup-script='apt-get install -y jq' --no-email"
         ),
         "new",
     ]
@@ -386,12 +390,13 @@ def test_copy(api, clock):
     copy = api(vm.copy("copy", cpu=4))
     # It flushes the VM's writes to disk first, so that the copy has them.
     assert server.commands == ["ssh worker flush", "cp --cpu=4 worker copy", "ssh copy true"]
-    assert (copy.name, copy.ssh_dest, copy.https_url, copy.status, copy.tags) == (
+    assert (copy.name, copy.ssh_dest, copy.https_url, copy.status, copy.tags, copy.egress) == (
         "copy",
         "copy.exe.xyz",
         "https://copy.exe.xyz",
         "running",
         ("ci",),
+        "all",
     )
 
 
@@ -424,12 +429,12 @@ def test_delete(api):
 
 
 def test_refresh(api):
-    paused = {"vms": [record("worker", status="paused", comment="hi")]}
+    paused = {"vms": [record("worker", status="paused", comment="hi", egress_policy="integrations")]}
     exe, _server = api.client({"ls worker": [{"vms": [record("worker")]}, paused, {"vms": []}]})
     vm = api(exe.vm("worker"))
     assert vm.status == "running"
     assert api(vm.refresh()) is None
-    assert (vm.status, vm.comment) == ("paused", "hi")
+    assert (vm.status, vm.comment, vm.egress) == ("paused", "hi", "integrations")
     with pytest.raises(exedev.NotFoundError):
         api(vm.refresh())
 
@@ -517,6 +522,24 @@ def test_tags_and_comment(api):
     other = api(exe.vm("other"))
     api(other.set_comment("x"))
     assert vm.comment == "hello there"
+
+
+def test_egress(api):
+    exe, server = api.client(
+        {
+            "ls worker": {"vms": [record("worker", egress_policy="all")]},
+            "ls shared": {"vms": [record("shared")]},
+            "egress worker integrations": {"vm_name": "worker", "egress_policy": "integrations"},
+        }
+    )
+    vm = api(exe.vm("worker"))
+    assert vm.egress == "all"
+    assert api(vm.set_egress("integrations")) == {"vm_name": "worker", "egress_policy": "integrations"}
+    assert vm.egress == "integrations"
+    # Only a VM's owner is told its policy.
+    assert api(exe.vm("shared")).egress is None
+    assert server.commands == ["ls worker", "egress worker integrations", "ls shared"]
+    assert not hasattr(exe, "egress")
 
 
 def test_vm_namespaces(api):
